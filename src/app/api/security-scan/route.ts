@@ -205,11 +205,17 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({ scanId, status: 'started', repos, model: selectedModel });
 }
 
+// Safety limits
+const MAX_COST_USD = 50;           // Hard abort if cost exceeds this
+const MAX_SCAN_DURATION_MS = 45 * 60 * 1000; // 45 minutes max for entire scan
+const AGENT_TIMEOUT_MS = 600000;   // 10 min per individual agent (down from 15)
+
 async function runSecurityScan(
   scanId: number, platformName: string, reposDir: string, repos: string[], model: ModelKey, repoFullPaths?: string[]
 ) {
   const startTime = Date.now();
   let totalCost = 0;
+  let aborted = false;
   const modelInfo = AVAILABLE_MODELS[model];
 
   // Build repo info for prompts
@@ -235,7 +241,7 @@ async function runSecurityScan(
   const mappingResult = await runClaudeAgentic(
     `${mappingPrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nNavigate to the listed paths to analyze each repo.`,
     workingDir,
-    900000, // 15 min for mapping
+    AGENT_TIMEOUT_MS,
     model
   );
 
@@ -251,8 +257,9 @@ async function runSecurityScan(
   agentStatus.forEach(a => a.status = 'running' as any);
   broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus });
 
-  const MAX_RETRIES = 2;
+  const MAX_RETRIES = 3;
   const MIN_OUTPUT_CHARS = 500;
+  const RETRY_DELAY_MS = 30000; // 30s delay between retries
 
   const agentPromises = SECURITY_AGENTS.map(async (agent, idx) => {
     const promptFile = path.join(PROMPTS_DIR, `${agent.id}.md`);
@@ -267,19 +274,45 @@ async function runSecurityScan(
     agentStatus[idx] = { ...agentStatus[idx], status: 'running' };
     broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
 
-    let result = await runClaudeAgentic(fullPrompt, workingDir, 900000, model);
+    // Check safety limits before starting
+    if (aborted) {
+      agentStatus[idx] = { ...agentStatus[idx], status: 'skipped' };
+      return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 } };
+    }
+
+    let result = await runClaudeAgentic(fullPrompt, workingDir, AGENT_TIMEOUT_MS, model);
     totalCost += result.cost;
+
+    // Check cost limit after each agent
+    if (totalCost > MAX_COST_USD) {
+      logAndBroadcast(`  [Security] 🛑 COST LIMIT reached ($${totalCost.toFixed(2)} > $${MAX_COST_USD}). Remaining agents will be skipped.`);
+      aborted = true;
+    }
+
+    // Check time limit
+    if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
+      logAndBroadcast(`  [Security] 🛑 TIME LIMIT reached (${Math.round((Date.now() - startTime) / 60000)}min). Remaining agents will be skipped.`);
+      aborted = true;
+    }
 
     // Auto-retry on failure or suspiciously short output
     let attempt = 1;
-    while (attempt < MAX_RETRIES && (!result.success || (result.result || '').length < MIN_OUTPUT_CHARS)) {
+    while (!aborted && attempt < MAX_RETRIES && (!result.success || (result.result || '').length < MIN_OUTPUT_CHARS)) {
       attempt++;
-      const reason = !result.success ? 'FAILED' : 'short output';
-      logAndBroadcast(`  [Security] 🔄 ${agent.name} retry ${attempt}/${MAX_RETRIES} (${reason}: ${(result.result || '').length} chars)`);
+      const reason = !result.success ? `FAILED: ${(result.result || '').substring(0, 200)}` : `short output: ${(result.result || '').length} chars`;
+      logAndBroadcast(`  [Security] 🔄 ${agent.name} retry ${attempt}/${MAX_RETRIES} (${reason})`);
       agentStatus[idx] = { ...agentStatus[idx], status: 'retrying', attempt };
       broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
-      result = await runClaudeAgentic(fullPrompt, workingDir, 900000, model);
+      // Delay before retry to avoid rate limits
+      await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+      result = await runClaudeAgentic(fullPrompt, workingDir, AGENT_TIMEOUT_MS, model);
       totalCost += result.cost;
+
+      // Re-check limits after each retry
+      if (totalCost > MAX_COST_USD || Date.now() - startTime > MAX_SCAN_DURATION_MS) {
+        logAndBroadcast(`  [Security] 🛑 Safety limit reached during retry. Stopping retries for ${agent.name}.`);
+        aborted = true;
+      }
     }
 
     const outputLen = (result.result || '').length;
@@ -316,9 +349,22 @@ async function runSecurityScan(
   getDb().prepare('UPDATE security_scans SET agent_results = ? WHERE id = ?')
     .run(JSON.stringify(agentResultsObj), scanId);
 
-  const agentResults = results.map(r =>
+  // Separate successful and failed agents
+  const successfulResults = results.filter(r => r.result.success && (r.result.result || '').length >= MIN_OUTPUT_CHARS);
+  const failedResults = results.filter(r => !r.result.success || (r.result.result || '').length < MIN_OUTPUT_CHARS);
+
+  if (failedResults.length > 0) {
+    logAndBroadcast(`  [Security] ⚠️ ${failedResults.length} agents failed and will be excluded from aggregation: ${failedResults.map(r => r.agent.name).join(', ')}`);
+  }
+
+  const agentResults = successfulResults.map(r =>
     `### ${r.agent.name}\n${r.result.result}`
   ).join('\n\n---\n\n');
+
+  // Add failed agents note for aggregation
+  const failedNote = failedResults.length > 0
+    ? `\n\n---\n\n### ⚠️ Agents Not Analyzed (Failed)\nThe following agents failed after ${MAX_RETRIES} attempts and their areas were NOT analyzed:\n${failedResults.map(r => `- **${r.agent.name}** (${r.agent.focus})`).join('\n')}\n\nThese areas require manual review or a re-scan.`
+    : '';
 
   // Build the full report (all agents combined with headers)
   const fullReport = `# ${platformName} — Full Security Audit Report\nDate: ${new Date().toISOString().split('T')[0]}\nModel: ${modelInfo.name}\nRepos: ${repos.join(', ')}\n\n` +
@@ -436,7 +482,7 @@ If an agent did NOT include a Coverage Report → mark "⚠️ Missing" and flag
 
 AGENT RESULTS:
 
-${agentResults}`,
+${agentResults}${failedNote}`,
     workingDir,
     600000,
     model

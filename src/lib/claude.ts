@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { exec } from 'child_process';
+import { exec, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -164,12 +164,13 @@ export function runClaudeAgentic(
     fs.writeFileSync(tempFile, prompt);
 
     const modelFlag = model !== 'sonnet' ? ` --model ${AVAILABLE_MODELS[model].id}` : '';
-    exec(
+    const child = exec(
       `cat "${tempFile}" | claude -p --dangerously-skip-permissions --output-format json${modelFlag}`,
       {
         cwd: repoDir,
         timeout: timeoutMs,
         maxBuffer: 10 * 1024 * 1024,
+        killSignal: 'SIGKILL', // Hard kill — SIGTERM may be ignored
         env: {
           ...process.env,
           PATH: `${process.env.HOME}/.npm-global/bin:${process.env.HOME}/.nvm/versions/node/${process.version}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ''}`,
@@ -177,14 +178,21 @@ export function runClaudeAgentic(
       },
       (error, stdout, stderr) => {
         try { fs.unlinkSync(tempFile); } catch { /* ignore */ }
+        clearTimeout(hardKillTimer);
 
         const durationMs = Date.now() - startTime;
 
+        // Log stderr for debugging agent failures
+        if (stderr && stderr.trim()) {
+          console.error(`[Claude CLI stderr] (${repoDir}): ${stderr.trim().substring(0, 500)}`);
+        }
+
         if (error) {
           const estimatedTokens = Math.ceil(prompt.length / 4);
+          const errDetail = stderr?.trim() ? `${error.message} | stderr: ${stderr.trim().substring(0, 300)}` : error.message;
           resolve({
             success: false,
-            result: `Error: ${error.message}`,
+            result: `Error: ${errDetail}`,
             durationMs,
             inputTokens: estimatedTokens,
             outputTokens: 0,
@@ -227,6 +235,18 @@ export function runClaudeAgentic(
         }
       }
     );
+
+    // Hard kill safety net: if exec timeout fails to kill, force-kill the process tree
+    const hardKillTimer = setTimeout(() => {
+      if (child.pid) {
+        console.error(`[Claude CLI] Hard kill after ${timeoutMs + 30000}ms for PID ${child.pid}`);
+        try {
+          // Kill entire process group (claude spawns child processes)
+          execSync(`kill -9 -${child.pid} 2>/dev/null || kill -9 ${child.pid} 2>/dev/null`, { stdio: 'pipe' });
+        } catch { /* process may already be dead */ }
+      }
+    }, timeoutMs + 30000); // 30s grace period after exec timeout
+    hardKillTimer.unref(); // Don't prevent Node.js from exiting
   });
 }
 

@@ -323,8 +323,11 @@ async function runFullScan(
 ) {
   const startTime = Date.now();
   let totalCost = 0;
+  let aborted = false;
   const modelInfo = AVAILABLE_MODELS[model];
-  const AGENT_TIMEOUT = 900000; // 15 min per agent (like Security scan)
+  const AGENT_TIMEOUT = 600000;    // 10 min per agent
+  const MAX_COST_USD = 50;         // Hard cost limit
+  const MAX_SCAN_DURATION_MS = 45 * 60 * 1000; // 45 min total
 
   // Build initial agent status list
   const agentStatus: Array<{ id: string; name: string; status: string; chars?: number; cost?: number; attempt?: number; subAgents?: number }> =
@@ -382,8 +385,9 @@ async function runFullScan(
   agentStatus.forEach(a => a.status = 'running');
   broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus });
 
-  const MAX_RETRIES = 2;
+  const MAX_RETRIES = 3;
   const MIN_OUTPUT_CHARS = 500;
+  const RETRY_DELAY_MS = 30000;
 
   const agentPromises = SCAN_AGENTS.map(async (agent, idx) => {
     const promptFile = path.join(PROMPTS_DIR, `${agent.id}.md`);
@@ -401,6 +405,12 @@ async function runFullScan(
 
     // ── Deep agents with sub-agents per module ──
     if (agent.deep && useSubAgents) {
+      // Check safety limits before starting sub-agents
+      if (aborted) {
+        agentStatus[idx] = { ...agentStatus[idx], status: 'skipped' };
+        return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 } };
+      }
+
       logAndBroadcast(`    [${agent.id}] ${modules.length} sub-agents (deep scan per module)`);
       agentStatus[idx] = { ...agentStatus[idx], subAgents: modules.length };
 
@@ -502,18 +512,40 @@ Format per finding:
 
 If no issues found: "✅ No ${agent.name} issues found."`;
 
+    // Check safety limits before starting
+    if (aborted) {
+      agentStatus[idx] = { ...agentStatus[idx], status: 'skipped' };
+      return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 } };
+    }
+
     let result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, model);
     totalCost += result.cost;
 
+    // Check limits after each agent
+    if (totalCost > MAX_COST_USD) {
+      logAndBroadcast(`  [Scan] 🛑 COST LIMIT ($${totalCost.toFixed(2)} > $${MAX_COST_USD}). Remaining agents skipped.`);
+      aborted = true;
+    }
+    if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
+      logAndBroadcast(`  [Scan] 🛑 TIME LIMIT (${Math.round((Date.now() - startTime) / 60000)}min). Remaining agents skipped.`);
+      aborted = true;
+    }
+
     let attempt = 1;
-    while (attempt < MAX_RETRIES && (!result.success || (result.result || '').length < MIN_OUTPUT_CHARS)) {
+    while (!aborted && attempt < MAX_RETRIES && (!result.success || (result.result || '').length < MIN_OUTPUT_CHARS)) {
       attempt++;
-      const reason = !result.success ? 'FAILED' : 'short output';
-      logAndBroadcast(`  [Scan] 🔄 ${agent.name} retry ${attempt}/${MAX_RETRIES} (${reason}: ${(result.result || '').length} chars)`);
+      const reason = !result.success ? `FAILED: ${(result.result || '').substring(0, 200)}` : `short output: ${(result.result || '').length} chars`;
+      logAndBroadcast(`  [Scan] 🔄 ${agent.name} retry ${attempt}/${MAX_RETRIES} (${reason})`);
       agentStatus[idx] = { ...agentStatus[idx], status: 'retrying', attempt };
       broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
+      await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
       result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, model);
       totalCost += result.cost;
+
+      if (totalCost > MAX_COST_USD || Date.now() - startTime > MAX_SCAN_DURATION_MS) {
+        logAndBroadcast(`  [Scan] 🛑 Safety limit reached during retry. Stopping retries for ${agent.name}.`);
+        aborted = true;
+      }
     }
 
     const outputLen = (result.result || '').length;
