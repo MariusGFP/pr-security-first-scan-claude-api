@@ -6,8 +6,13 @@ import { createWebhook, cloneRepo } from '@/lib/github';
 import { logAndBroadcast } from '@/lib/websocket';
 import path from 'path';
 import fs from 'fs';
+import { getKeyValue } from '@/lib/claude';
 
-const REPOS_DIR = path.join(process.env.HOME || '~', 'repos');
+function getReposDir(): string {
+  const configured = getKeyValue('REPOS_DIR');
+  if (configured) return configured.replace(/^~/, process.env.HOME || '~');
+  return path.join(process.env.HOME || '~', 'repos');
+}
 const WEBHOOK_URL = 'https://webhook.serendipity.education/webhook';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'mac-mini-claude-webhook-2024';
 
@@ -30,7 +35,7 @@ export async function POST(req: NextRequest) {
   }
 
   const fullName = `${org}/${name}`;
-  const localPath = path.join(REPOS_DIR, name);
+  const localPath = path.join(getReposDir(), name);
 
   try {
     // 1. Clone if not exists

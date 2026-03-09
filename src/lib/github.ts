@@ -1,7 +1,26 @@
 import { execSync } from 'child_process';
 import path from 'path';
+import fs from 'fs';
 
-const REPOS_DIR = path.join(process.env.HOME || '~', 'repos');
+function getReposDir(): string {
+  try {
+    const keysFile = path.join(process.env.HOME || '~', '.keys');
+    const content = fs.readFileSync(keysFile, 'utf8');
+    const match = content.match(/^export\s+REPOS_DIR=["']?(.+?)["']?\s*$/m);
+    if (match) return match[1].replace(/^~/, process.env.HOME || '~');
+  } catch { /* ignore */ }
+  return path.join(process.env.HOME || '~', 'repos');
+}
+
+function getGhToken(): string {
+  try {
+    const keysFile = path.join(process.env.HOME || '~', '.keys');
+    const content = fs.readFileSync(keysFile, 'utf8');
+    const match = content.match(/^export\s+GH_TOKEN=["']?(.+?)["']?\s*$/m);
+    if (match) return match[1];
+  } catch { /* ignore */ }
+  return process.env.GH_TOKEN || '';
+}
 
 const execOptions = {
   stdio: 'pipe' as const,
@@ -60,8 +79,8 @@ export function getWebhookStatus(org: string, repo: string, hookId: number): { a
  * Clone a repository
  */
 export function cloneRepo(org: string, repo: string): string {
-  const localPath = path.join(REPOS_DIR, repo);
-  const ghToken = process.env.GH_TOKEN || '';
+  const localPath = path.join(getReposDir(), repo);
+  const ghToken = getGhToken();
   const ghUser = 'MariusGFP';
 
   execSync(`git clone https://${ghUser}:${ghToken}@github.com/${org}/${repo}.git "${localPath}"`, {
