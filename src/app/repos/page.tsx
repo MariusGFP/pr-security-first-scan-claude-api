@@ -121,12 +121,18 @@ export default function ReposPage() {
   async function startScan(repoId: number, model: string) {
     setFreshnessCheck(null);
     setCheckingFreshness(null);
-    await fetch('/api/scan', {
+    const res = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repoId, model }),
     });
-    alert(`First Scan started with ${models.find(m => m.key === model)?.name || model}! Check Logs for progress.`);
+    const data = await res.json();
+    if (res.ok) {
+      alert(`First Scan started with ${models.find(m => m.key === model)?.name || model}! Check Logs for progress.`);
+    } else {
+      const details = data.details ? `\n\n${data.details.join('\n')}` : '';
+      alert(`❌ ${data.error}${details}`);
+    }
   }
 
   async function updateAndScan() {

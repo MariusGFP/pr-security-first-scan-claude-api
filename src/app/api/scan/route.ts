@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDb, getRepoById, addCost } from '@/lib/db';
 import { runClaudeAgentic, AVAILABLE_MODELS, type ModelKey, getKeyValue } from '@/lib/claude';
 import { logAndBroadcast, broadcastScanProgress } from '@/lib/websocket';
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -48,6 +49,71 @@ const SCAN_AGENTS = [
   { id: '09-dependency-check',  name: 'Dependencies',      focus: 'Outdated packages, CVEs, unnecessary dependencies, license issues',                                deep: false },
   { id: '10-ai-code-safety',    name: 'AI Code Safety',    focus: 'Hallucinated APIs, fake implementations, copy-paste errors, inconsistent auth, missing validation', deep: false },
 ];
+
+/**
+ * Pre-flight checks before starting a first scan.
+ * Returns an array of error messages. Empty = all checks passed.
+ */
+function runPreFlightChecks(repoDir: string): string[] {
+  const errors: string[] = [];
+
+  // 1. Check prompt files exist
+  const detectionPrompt = path.join(PROMPTS_DIR, '00-framework-detection.md');
+  if (!fs.existsSync(detectionPrompt)) {
+    errors.push(`Prompt-Dateien nicht gefunden: ${PROMPTS_DIR} existiert nicht`);
+  } else {
+    const missingPrompts = SCAN_AGENTS
+      .map(a => a.id)
+      .filter(id => !fs.existsSync(path.join(PROMPTS_DIR, `${id}.md`)));
+    if (missingPrompts.length > 0) {
+      errors.push(`Fehlende Agent-Prompts: ${missingPrompts.join(', ')}`);
+    }
+  }
+
+  // 2. Check Claude CLI available
+  try {
+    execSync('which claude', { timeout: 5000, stdio: 'pipe' });
+  } catch {
+    errors.push('Claude CLI nicht gefunden. Bitte installieren: npm install -g @anthropic-ai/claude-code');
+  }
+
+  // 3. Check SSH known_hosts for github.com (auto-fix)
+  const sshDir = path.join(process.env.HOME || '~', '.ssh');
+  const knownHostsFile = path.join(sshDir, 'known_hosts');
+  let githubKnown = false;
+  if (fs.existsSync(knownHostsFile)) {
+    githubKnown = fs.readFileSync(knownHostsFile, 'utf8').includes('github.com');
+  }
+  if (!githubKnown) {
+    try {
+      if (!fs.existsSync(sshDir)) fs.mkdirSync(sshDir, { mode: 0o700, recursive: true });
+      const keys = execSync('ssh-keyscan -t ed25519 github.com 2>/dev/null', { timeout: 10000, stdio: 'pipe' }).toString();
+      if (keys.trim()) {
+        fs.appendFileSync(knownHostsFile, keys);
+        logAndBroadcast('  [Scan] ✅ GitHub SSH key added to known_hosts');
+      } else {
+        errors.push('GitHub SSH-Key konnte nicht abgerufen werden. Manuell: ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts');
+      }
+    } catch {
+      errors.push('GitHub SSH-Key konnte nicht hinzugefügt werden. Manuell: ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts');
+    }
+  }
+
+  // 4. Check repo exists and is a git repo
+  if (!fs.existsSync(repoDir)) {
+    errors.push(`Repo-Verzeichnis nicht gefunden: ${repoDir}`);
+  } else if (!fs.existsSync(path.join(repoDir, '.git'))) {
+    errors.push(`Kein Git-Repository: ${repoDir}`);
+  }
+
+  // 5. Check ANTHROPIC_API_KEY is set
+  const apiKey = getKeyValue('ANTHROPIC_API_KEY') || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    errors.push('ANTHROPIC_API_KEY nicht gesetzt. Unter Settings konfigurieren.');
+  }
+
+  return errors;
+}
 
 // ── Module Discovery ──
 // Discover logical modules by analyzing source directory structure
@@ -222,6 +288,15 @@ export async function POST(req: NextRequest) {
   const repoDir = resolveRepoDir(repo);
   if (!repoDir) {
     return NextResponse.json({ error: `Repo directory not found. Checked: ${repo.local_path} and REPOS_DIR. Update the path in Settings or re-clone.` }, { status: 404 });
+  }
+
+  // Pre-flight checks
+  const preFlightErrors = runPreFlightChecks(repoDir);
+  if (preFlightErrors.length > 0) {
+    return NextResponse.json({
+      error: 'Pre-Flight-Check fehlgeschlagen',
+      details: preFlightErrors,
+    }, { status: 400 });
   }
 
   const modelInfo = AVAILABLE_MODELS[selectedModel];

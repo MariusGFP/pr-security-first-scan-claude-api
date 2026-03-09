@@ -335,7 +335,8 @@ export default function SecurityPage() {
         alert(`Security Scan gestartet! ${data.repos.length} Repos, Fortschritt unter Logs.`);
         loadData();
       } else {
-        alert(`Fehler: ${data.error}`);
+        const details = data.details ? `\n\n${data.details.join('\n')}` : '';
+        alert(`❌ ${data.error}${details}`);
       }
     } catch (e: any) {
       alert(`Fehler: ${e.message}`);
