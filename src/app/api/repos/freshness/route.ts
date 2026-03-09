@@ -66,16 +66,43 @@ function checkFreshness(repoDir: string, repoName: string): FreshnessResult {
     }
 
     // Fetch latest from remote
-    execSync('git fetch origin', { ...execOpts, cwd: repoDir });
+    try {
+      execSync('git fetch origin', { ...execOpts, cwd: repoDir, stdio: 'pipe' });
+    } catch (fetchErr: any) {
+      console.warn(`git fetch failed for ${repoName}:`, fetchErr.stderr?.toString?.() || fetchErr.message);
+      // Continue anyway — compare with whatever origin info we have
+    }
 
-    const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: repoDir, timeout: 5000 }).toString().trim();
+    let branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: repoDir, timeout: 5000 }).toString().trim();
     const localCommit = execSync('git rev-parse --short HEAD', { cwd: repoDir, timeout: 5000 }).toString().trim();
+
+    // Detached HEAD — try to find the default branch
+    if (branch === 'HEAD') {
+      try {
+        // Try origin/HEAD -> origin/main etc.
+        const defaultRef = execSync('git symbolic-ref refs/remotes/origin/HEAD', { cwd: repoDir, timeout: 5000, stdio: 'pipe' }).toString().trim();
+        branch = defaultRef.replace('refs/remotes/origin/', '');
+      } catch {
+        // Fallback: try 'main', then 'master'
+        try {
+          execSync('git rev-parse --verify origin/main', { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+          branch = 'main';
+        } catch {
+          try {
+            execSync('git rev-parse --verify origin/master', { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+            branch = 'master';
+          } catch {
+            // Give up — can't determine branch
+          }
+        }
+      }
+    }
 
     let remoteCommit = '';
     let behind = 0;
 
     // Validate branch name (must not start with -)
-    if (/^[\w][\w\-./]*$/.test(branch)) {
+    if (branch !== 'HEAD' && /^[\w][\w\-./]*$/.test(branch)) {
       try {
         remoteCommit = execSync(`git rev-parse --short origin/${branch}`, { cwd: repoDir, timeout: 5000 }).toString().trim();
         const behindStr = execSync(`git rev-list --count HEAD..origin/${branch}`, { cwd: repoDir, timeout: 5000 }).toString().trim();

@@ -293,14 +293,27 @@ export default function SecurityPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repoPaths }),
       });
+      if (!res.ok) {
+        console.warn('Freshness check failed:', res.status);
+        setCheckingFreshness(false);
+        executeScan();
+        return;
+      }
       const data = await res.json();
-      const outdated = (data.repos || []).filter((r: any) => !r.upToDate && r.behind > 0);
+      const repoResults = data.repos || [];
+      const outdated = repoResults.filter((r: any) => !r.upToDate && r.behind > 0);
+      const errors = repoResults.filter((r: any) => r.error);
+      if (errors.length > 0) {
+        console.warn('Freshness check errors:', errors.map((r: any) => `${r.name}: ${r.error}`));
+      }
       if (outdated.length > 0) {
-        setFreshnessResults(data.repos);
+        setFreshnessResults(repoResults);
         setCheckingFreshness(false);
         return;
       }
-    } catch { /* on error, proceed with scan */ }
+    } catch (e) {
+      console.error('Freshness check exception:', e);
+    }
     setCheckingFreshness(false);
     executeScan();
   }
