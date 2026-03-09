@@ -74,6 +74,20 @@ export default function SecurityPage() {
   const [diffResult, setDiffResult] = useState<string | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
 
+  // Freshness check state
+  const [checkingFreshness, setCheckingFreshness] = useState(false);
+  const [freshnessResults, setFreshnessResults] = useState<Array<{
+    path: string;
+    name: string;
+    upToDate: boolean;
+    behind: number;
+    branch: string;
+    localCommit: string;
+    remoteCommit: string;
+    error?: string;
+  }> | null>(null);
+  const [updatingRepos, setUpdatingRepos] = useState(false);
+
   async function loadDiff() {
     if (!viewingScan || diffLoading) return;
     // Find previous completed scan for same platform
@@ -263,7 +277,7 @@ export default function SecurityPage() {
     setSelectedRepoIds(new Set());
   }
 
-  async function startScan() {
+  async function checkFreshnessAndScan() {
     if (!platformName || selectedRepoIds.size === 0) {
       alert('Please select a platform and at least one repo.');
       return;
@@ -272,6 +286,30 @@ export default function SecurityPage() {
     const selectedRepos = repos.filter(r => selectedRepoIds.has(r.id));
     const repoPaths = selectedRepos.map(r => r.local_path);
 
+    setCheckingFreshness(true);
+    try {
+      const res = await fetch('/api/repos/freshness', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoPaths }),
+      });
+      const data = await res.json();
+      const outdated = (data.repos || []).filter((r: any) => !r.upToDate && r.behind > 0);
+      if (outdated.length > 0) {
+        setFreshnessResults(data.repos);
+        setCheckingFreshness(false);
+        return;
+      }
+    } catch { /* on error, proceed with scan */ }
+    setCheckingFreshness(false);
+    executeScan();
+  }
+
+  async function executeScan() {
+    const selectedRepos = repos.filter(r => selectedRepoIds.has(r.id));
+    const repoPaths = selectedRepos.map(r => r.local_path);
+
+    setFreshnessResults(null);
     setStarting(true);
     try {
       const res = await fetch('/api/security-scan', {
@@ -281,16 +319,46 @@ export default function SecurityPage() {
       });
       const data = await res.json();
       if (res.ok) {
-        alert(`🔒 Security Scan gestartet! ${data.repos.length} Repos, Fortschritt unter Logs.`);
+        alert(`Security Scan gestartet! ${data.repos.length} Repos, Fortschritt unter Logs.`);
         loadData();
       } else {
-        alert(`❌ Fehler: ${data.error}`);
+        alert(`Fehler: ${data.error}`);
       }
     } catch (e: any) {
-      alert(`❌ Fehler: ${e.message}`);
+      alert(`Fehler: ${e.message}`);
     } finally {
       setStarting(false);
     }
+  }
+
+  async function updateOutdatedAndScan() {
+    if (!freshnessResults) return;
+    const outdated = freshnessResults.filter(r => !r.upToDate && r.behind > 0);
+    setUpdatingRepos(true);
+
+    const results = await Promise.all(
+      outdated.map(async (repo) => {
+        try {
+          await fetch('/api/repos/freshness/pull', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ repoPath: repo.path }),
+          });
+          return { name: repo.name, success: true };
+        } catch {
+          console.warn(`Failed to update ${repo.name}`);
+          return { name: repo.name, success: false };
+        }
+      })
+    );
+
+    const failed = results.filter(r => !r.success);
+    if (failed.length > 0) {
+      console.warn(`Failed to update ${failed.length} repo(s):`, failed.map(r => r.name));
+    }
+
+    setUpdatingRepos(false);
+    executeScan();
   }
 
   if (loading) return <div className="text-[#666]">Lade Security Scans...</div>;
@@ -731,11 +799,11 @@ export default function SecurityPage() {
             </div>
             <div className="flex flex-col items-end">
               <button
-                onClick={startScan}
-                disabled={starting || selectedRepoIds.size === 0}
+                onClick={checkFreshnessAndScan}
+                disabled={starting || checkingFreshness || selectedRepoIds.size === 0}
                 className="bg-red-600 hover:bg-red-500 text-white px-6 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
               >
-                {starting ? '⏳ Starting...' : `🔒 Start Scan (${selectedRepoIds.size} Repos)`}
+                {checkingFreshness ? '⏳ Checking repos...' : starting ? '⏳ Starting...' : `🔒 Start Scan (${selectedRepoIds.size} Repos)`}
               </button>
               <p className="text-xs text-[#555] mt-1">
                 Phase 0: Architecture → Phase 1: 8 Agents → Phase 2: Report
@@ -821,6 +889,56 @@ export default function SecurityPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Freshness Check Dialog */}
+      {freshnessResults && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-[#1a1a1a] border border-[#333] rounded-xl shadow-2xl p-6 max-w-lg w-full mx-4">
+            <h3 className="text-base font-semibold mb-3 text-yellow-400">Repos nicht aktuell</h3>
+            <p className="text-sm text-[#ccc] mb-4">
+              Folgende Repos sind nicht auf dem neuesten Stand:
+            </p>
+            <div className="space-y-2 mb-4 max-h-60 overflow-y-auto">
+              {freshnessResults.filter(r => !r.upToDate && r.behind > 0).map((repo, i) => (
+                <div key={i} className="bg-[#111] rounded-lg p-3 text-xs font-mono">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-white font-semibold">{repo.name}</span>
+                    <span className="text-yellow-400">{repo.behind} Commit{repo.behind !== 1 ? 's' : ''} behind</span>
+                  </div>
+                  <div className="text-[#888]">
+                    <span>Branch: {repo.branch}</span>
+                    <span className="mx-2">|</span>
+                    <span>Lokal: {repo.localCommit}</span>
+                    <span className="mx-2">|</span>
+                    <span>Remote: {repo.remoteCommit}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={updateOutdatedAndScan}
+                disabled={updatingRepos}
+                className="flex-1 bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+              >
+                {updatingRepos ? '⏳ Updating...' : 'Repos updaten & scannen'}
+              </button>
+              <button
+                onClick={() => executeScan()}
+                className="flex-1 bg-[#252525] hover:bg-[#333] text-[#ccc] px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-[#444]"
+              >
+                Ohne Update scannen
+              </button>
+            </div>
+            <button
+              onClick={() => setFreshnessResults(null)}
+              className="w-full mt-2 text-xs text-[#666] hover:text-[#999] transition-colors py-1"
+            >
+              Abbrechen
+            </button>
+          </div>
         </div>
       )}
     </div>

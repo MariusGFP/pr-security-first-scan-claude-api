@@ -22,6 +22,17 @@ export default function ReposPage() {
   const [scanMenuRepo, setScanMenuRepo] = useState<number | null>(null);
   const [pullingRepo, setPullingRepo] = useState<number | null>(null);
 
+  // Freshness check state
+  const [freshnessCheck, setFreshnessCheck] = useState<{
+    repoId: number;
+    model: string;
+    behind: number;
+    branch: string;
+    localCommit: string;
+    remoteCommit: string;
+  } | null>(null);
+  const [checkingFreshness, setCheckingFreshness] = useState<number | null>(null);
+
   async function loadRepos() {
     const res = await fetch('/api/repos');
     setRepos(await res.json());
@@ -79,14 +90,69 @@ export default function ReposPage() {
     }
   }
 
-  async function startScan(repoId: number, model: string) {
+  async function checkFreshnessAndScan(repoId: number, model: string) {
     setScanMenuRepo(null);
+    setCheckingFreshness(repoId);
+    try {
+      const res = await fetch('/api/repos/freshness', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoId }),
+      });
+      const data = await res.json();
+      const repo = data.repos?.[0];
+      if (repo && !repo.upToDate && repo.behind > 0) {
+        setCheckingFreshness(null);
+        setFreshnessCheck({
+          repoId,
+          model,
+          behind: repo.behind,
+          branch: repo.branch,
+          localCommit: repo.localCommit,
+          remoteCommit: repo.remoteCommit,
+        });
+        return;
+      }
+    } catch { /* on error, proceed with scan */ }
+    setCheckingFreshness(null);
+    startScan(repoId, model);
+  }
+
+  async function startScan(repoId: number, model: string) {
+    setFreshnessCheck(null);
+    setCheckingFreshness(null);
     await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repoId, model }),
     });
     alert(`First Scan started with ${models.find(m => m.key === model)?.name || model}! Check Logs for progress.`);
+  }
+
+  async function updateAndScan() {
+    if (!freshnessCheck) return;
+    const { repoId, model } = freshnessCheck;
+    setFreshnessCheck(null);
+    setPullingRepo(repoId);
+    try {
+      const res = await fetch('/api/repos/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoId }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        alert(`Pull failed: ${data.error}`);
+        setPullingRepo(null);
+        return;
+      }
+    } catch (e: any) {
+      alert(`Pull failed: ${e.message}`);
+      setPullingRepo(null);
+      return;
+    }
+    setPullingRepo(null);
+    startScan(repoId, model);
   }
 
   if (loading) return <div className="text-[#666]">Loading repositories...</div>;
@@ -170,9 +236,10 @@ export default function ReposPage() {
                   <div className="relative">
                     <button
                       onClick={() => setScanMenuRepo(scanMenuRepo === repo.id ? null : repo.id)}
+                      disabled={checkingFreshness === repo.id}
                       className="btn-secondary text-sm"
                     >
-                      🔍 First Scan ▾
+                      {checkingFreshness === repo.id ? '⏳ Checking...' : '🔍 First Scan ▾'}
                     </button>
 
                     {/* Model Selection Dropdown */}
@@ -184,7 +251,7 @@ export default function ReposPage() {
                         {models.map(model => (
                           <button
                             key={model.key}
-                            onClick={() => startScan(repo.id, model.key)}
+                            onClick={() => checkFreshnessAndScan(repo.id, model.key)}
                             className="w-full text-left px-3 py-2.5 hover:bg-[#252525] transition-colors border-b border-[#222] last:border-0"
                           >
                             <div className="flex items-center justify-between">
@@ -206,6 +273,46 @@ export default function ReposPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Freshness Check Dialog */}
+      {freshnessCheck && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-[#1a1a1a] border border-[#333] rounded-xl shadow-2xl p-6 max-w-md w-full mx-4">
+            <h3 className="text-base font-semibold mb-3 text-yellow-400">Repo nicht aktuell</h3>
+            <p className="text-sm text-[#ccc] mb-4">
+              Das Repository ist <span className="text-yellow-400 font-mono">{freshnessCheck.behind} Commit{freshnessCheck.behind !== 1 ? 's' : ''}</span> hinter
+              <span className="font-mono text-[#888]"> origin/{freshnessCheck.branch}</span>.
+            </p>
+            <div className="bg-[#111] rounded-lg p-3 mb-4 text-xs font-mono text-[#888]">
+              <div>Lokal: {freshnessCheck.localCommit}</div>
+              <div>Remote: {freshnessCheck.remoteCommit}</div>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={updateAndScan}
+                className="flex-1 bg-claude-600 hover:bg-claude-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+              >
+                Repo updaten & scannen
+              </button>
+              <button
+                onClick={() => {
+                  const { repoId, model } = freshnessCheck;
+                  startScan(repoId, model);
+                }}
+                className="flex-1 bg-[#252525] hover:bg-[#333] text-[#ccc] px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-[#444]"
+              >
+                Ohne Update scannen
+              </button>
+            </div>
+            <button
+              onClick={() => { setFreshnessCheck(null); setCheckingFreshness(null); }}
+              className="w-full mt-2 text-xs text-[#666] hover:text-[#999] transition-colors py-1"
+            >
+              Abbrechen
+            </button>
+          </div>
         </div>
       )}
     </div>
