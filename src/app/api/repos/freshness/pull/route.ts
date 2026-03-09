@@ -67,9 +67,9 @@ export async function POST(req: NextRequest) {
       PATH: `${process.env.PATH || ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`,
     };
 
-    execSync('git fetch origin', { cwd: resolved, timeout: 30000, env: execEnv });
-    execSync(`git checkout -f -- ${branch}`, { cwd: resolved, timeout: 10000, env: execEnv });
-    execSync(`git reset --hard origin/${branch}`, { cwd: resolved, timeout: 30000, env: execEnv });
+    execSync('git fetch origin', { cwd: resolved, timeout: 30000, env: execEnv, stdio: 'pipe' });
+    execSync(`git checkout -f ${branch}`, { cwd: resolved, timeout: 10000, env: execEnv, stdio: 'pipe' });
+    execSync(`git reset --hard origin/${branch}`, { cwd: resolved, timeout: 30000, env: execEnv, stdio: 'pipe' });
 
     const commit = execSync('git log --oneline -1', { cwd: resolved, timeout: 5000 }).toString().trim();
 

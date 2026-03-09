@@ -352,11 +352,16 @@ export default function SecurityPage() {
     const results = await Promise.all(
       outdated.map(async (repo) => {
         try {
-          await fetch('/api/repos/freshness/pull', {
+          const res = await fetch('/api/repos/freshness/pull', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ repoPath: repo.path }),
           });
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({ error: 'Unknown error' }));
+            console.warn(`Failed to update ${repo.name}: ${data.error}`);
+            return { name: repo.name, success: false };
+          }
           return { name: repo.name, success: true };
         } catch {
           console.warn(`Failed to update ${repo.name}`);
@@ -366,11 +371,13 @@ export default function SecurityPage() {
     );
 
     const failed = results.filter(r => !r.success);
+    setUpdatingRepos(false);
+
     if (failed.length > 0) {
-      console.warn(`Failed to update ${failed.length} repo(s):`, failed.map(r => r.name));
+      alert(`❌ Update fehlgeschlagen für:\n${failed.map(r => r.name).join('\n')}\n\nScan wird nicht gestartet.`);
+      return;
     }
 
-    setUpdatingRepos(false);
     executeScan();
   }
 
