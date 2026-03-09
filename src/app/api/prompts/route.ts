@@ -4,8 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 
-const DASHBOARD_DIR = process.env.DASHBOARD_DIR || path.join(process.env.HOME || '~', 'automation', 'claude-dashboard');
-const PROMPTS_DIR = path.join(DASHBOARD_DIR, 'prompts');
+const PROMPTS_DIR = path.join(process.cwd(), 'prompts');
 
 // GET: List all prompts with contents
 export async function GET() {

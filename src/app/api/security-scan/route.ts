@@ -7,8 +7,7 @@ import { logAndBroadcast, broadcastScanProgress } from '@/lib/websocket';
 import fs from 'fs';
 import path from 'path';
 
-const DASHBOARD_DIR = process.env.DASHBOARD_DIR || path.join(process.env.HOME || '~', 'automation', 'claude-dashboard');
-const PROMPTS_DIR = path.join(DASHBOARD_DIR, 'prompts', 'security-scan');
+const PROMPTS_DIR = path.join(process.cwd(), 'prompts', 'security-scan');
 
 function getAuditsDir(): string {
   const fromKeys = getKeyValue('AUDITS_DIR');

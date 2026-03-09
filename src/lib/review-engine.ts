@@ -11,8 +11,7 @@ import { AGENTS, DEFAULT_THRESHOLDS } from '@/types';
 import type { AgentConfig, Thresholds } from '@/types';
 
 // All-in-One: Prompts liegen im Projekt-Ordner
-const DASHBOARD_DIR = process.env.DASHBOARD_DIR || path.join(process.env.HOME || '~', 'automation', 'claude-dashboard');
-const PROMPTS_DIR = path.join(DASHBOARD_DIR, 'prompts');
+const PROMPTS_DIR = path.join(process.cwd(), 'prompts');
 const REPOS_DIR = path.join(process.env.HOME || '~', 'repos');
 const LOGS_DIR = path.join(process.env.HOME || '~', 'automation', 'logs');
 
