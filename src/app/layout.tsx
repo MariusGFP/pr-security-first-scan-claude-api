@@ -14,6 +14,7 @@ const navItems = [
   { href: '/security', label: 'Security Scan', icon: '🔒' },
   { href: '/logs', label: 'Logs', icon: '📋' },
   { href: '/settings', label: 'Settings', icon: '⚙️' },
+  { href: '/updates', label: 'Updates', icon: '🔄' },
 ];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
