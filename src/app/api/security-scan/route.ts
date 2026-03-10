@@ -198,7 +198,10 @@ export async function POST(req: NextRequest) {
 
   // Run async — pass full paths for explicit repos
   runSecurityScan(scanId, platformName, resolvedDir, repos, selectedModel, repoFullPaths).catch(e => {
-    logAndBroadcast(`❌ Security Scan failed: ${e.message}`);
+    const errMsg = e instanceof Error ? e.message : String(e);
+    const errStack = e instanceof Error ? e.stack : '';
+    logAndBroadcast(`❌ Security Scan failed: ${errMsg}`);
+    if (errStack) console.error(`[Security Scan] Stack trace for scan ${scanId}:\n${errStack}`);
     getDb().prepare('UPDATE security_scans SET status = ? WHERE id = ?').run('failed', scanId);
   });
 
@@ -206,7 +209,6 @@ export async function POST(req: NextRequest) {
 }
 
 // Safety limits
-const MAX_COST_USD = 50;           // Hard abort if cost exceeds this
 const MAX_SCAN_DURATION_MS = 45 * 60 * 1000; // 45 minutes max for entire scan
 const AGENT_TIMEOUT_MS = 600000;   // 10 min per individual agent (down from 15)
 
@@ -238,19 +240,56 @@ async function runSecurityScan(
     .replace(/\{\{PLATFORM_NAME\}\}/g, platformName)
     .replace(/\{\{REPOS_DIR\}\}/g, workingDir);
 
+  const mappingOutputFile = path.join(getAuditsDir(), 'security-audits', `_mapping-${scanId}.md`);
   const mappingResult = await runClaudeAgentic(
-    `${mappingPrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nNavigate to the listed paths to analyze each repo.`,
+    `${mappingPrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nNavigate to the listed paths to analyze each repo.
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE architecture map to this file: ${mappingOutputFile}
+2. Do NOT write files to any other location.
+3. Your text response should be a brief summary only — the detailed map goes in the file.`,
     workingDir,
     AGENT_TIMEOUT_MS,
     model
   );
 
   totalCost += mappingResult.cost;
-  const architectureMap = mappingResult.success ? mappingResult.result : 'Architecture mapping failed — proceed without context.';
+
+  // Prefer file output over result text
+  let architectureMap = mappingResult.success ? mappingResult.result : 'Architecture mapping failed — proceed without context.';
+  if (fs.existsSync(mappingOutputFile)) {
+    const fileContent = fs.readFileSync(mappingOutputFile, 'utf8');
+    if (fileContent.length > architectureMap.length) {
+      logAndBroadcast(`  [Security] 📄 Architecture Mapping: using file output (${fileContent.length} chars) over result text (${architectureMap.length} chars)`);
+      architectureMap = fileContent;
+    }
+    try { fs.unlinkSync(mappingOutputFile); } catch { /* ignore */ }
+  }
   logAndBroadcast(`  [Security] ✅ Architecture Mapping done ($${mappingResult.cost.toFixed(2)})`);
 
   // Save architecture map to DB
   getDb().prepare('UPDATE security_scans SET architecture_map = ? WHERE id = ?').run(architectureMap, scanId);
+
+  // ── Create audit directory BEFORE agents run (so agents can write files there) ──
+  const platformSlug = platformName.toLowerCase().replace(/\s+/g, '-');
+  const platformAuditsDir = path.join(getAuditsDir(), 'security-audits', platformSlug);
+  if (!fs.existsSync(platformAuditsDir)) fs.mkdirSync(platformAuditsDir, { recursive: true });
+
+  const existingAudits = fs.readdirSync(platformAuditsDir)
+    .filter(f => f.match(/^\d{2}-audit-/))
+    .sort();
+  const nextNum = existingAudits.length + 1;
+  const numStr = String(nextNum).padStart(2, '0');
+
+  const now = new Date();
+  const dateTimeStr = `${now.toISOString().split('T')[0]}_${now.toTimeString().slice(0, 8).replace(/:/g, '-')}`;
+  const auditFolderName = `${numStr}-audit-${dateTimeStr}`;
+  const auditDir = path.join(platformAuditsDir, auditFolderName);
+  fs.mkdirSync(auditDir, { recursive: true });
+
+  // Save architecture map to audit dir
+  fs.writeFileSync(path.join(auditDir, '00-architecture-map.md'), architectureMap);
+  logAndBroadcast(`  [Security] 📁 Audit folder: ${auditDir}`);
 
   // ── Phase 1: 8 Security Agents parallel ──
   logAndBroadcast(`  [Security] Phase 1: ${SECURITY_AGENTS.length} Security Agents parallel (${modelInfo.name})...`);
@@ -269,7 +308,14 @@ async function runSecurityScan(
       .replace(/\{\{REPOS_DIR\}\}/g, workingDir)
       .replace(/\{\{ARCHITECTURE_MAP\}\}/g, architectureMap.substring(0, 15000));
 
-    const fullPrompt = `${basePrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nYou have full access to ALL files. Navigate to the paths listed above to analyze each repo.`;
+    const outputFile = path.join(auditDir, `${agent.id}.md`);
+    const fullPrompt = `${basePrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nYou have full access to ALL files. Navigate to the paths listed above to analyze each repo.
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE report to this file: ${outputFile}
+2. Do NOT write files to any other location. No docs/, no Desktop/, no other folders.
+3. The file must contain your FULL detailed analysis with all findings, not just a summary.
+4. Your text response should be a brief summary only — the detailed report goes in the file.`;
 
     agentStatus[idx] = { ...agentStatus[idx], status: 'running' };
     broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
@@ -283,13 +329,7 @@ async function runSecurityScan(
     let result = await runClaudeAgentic(fullPrompt, workingDir, AGENT_TIMEOUT_MS, model);
     totalCost += result.cost;
 
-    // Check cost limit after each agent
-    if (totalCost > MAX_COST_USD) {
-      logAndBroadcast(`  [Security] 🛑 COST LIMIT reached ($${totalCost.toFixed(2)} > $${MAX_COST_USD}). Remaining agents will be skipped.`);
-      aborted = true;
-    }
-
-    // Check time limit
+    // Check time limit after each agent
     if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
       logAndBroadcast(`  [Security] 🛑 TIME LIMIT reached (${Math.round((Date.now() - startTime) / 60000)}min). Remaining agents will be skipped.`);
       aborted = true;
@@ -309,15 +349,24 @@ async function runSecurityScan(
       totalCost += result.cost;
 
       // Re-check limits after each retry
-      if (totalCost > MAX_COST_USD || Date.now() - startTime > MAX_SCAN_DURATION_MS) {
-        logAndBroadcast(`  [Security] 🛑 Safety limit reached during retry. Stopping retries for ${agent.name}.`);
+      if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
+        logAndBroadcast(`  [Security] 🛑 Time limit reached during retry. Stopping retries for ${agent.name}.`);
         aborted = true;
+      }
+    }
+
+    // Check if agent wrote a file (preferred) — use file content over result text
+    if (fs.existsSync(outputFile)) {
+      const fileContent = fs.readFileSync(outputFile, 'utf8');
+      if (fileContent.length > (result.result || '').length) {
+        logAndBroadcast(`  [Security] 📄 ${agent.name}: using file output (${fileContent.length} chars) over result text (${(result.result || '').length} chars)`);
+        result = { ...result, result: fileContent, success: true };
       }
     }
 
     const outputLen = (result.result || '').length;
     if (!result.success) {
-      logAndBroadcast(`  [Security] ❌ ${agent.name} FAILED after ${attempt} attempts: ${result.result.substring(0, 200)}`);
+      logAndBroadcast(`  [Security] ❌ ${agent.name} FAILED after ${attempt} attempts: ${(result.result || '').substring(0, 200)}`);
       agentStatus[idx] = { ...agentStatus[idx], status: 'failed', chars: outputLen, cost: result.cost };
     } else if (outputLen < MIN_OUTPUT_CHARS) {
       logAndBroadcast(`  [Security] ⚠️ ${agent.name} still short after ${attempt} attempts (${outputLen} chars)`);
@@ -376,10 +425,11 @@ async function runSecurityScan(
   getDb().prepare('UPDATE security_scans SET full_report = ? WHERE id = ?')
     .run(fullReport, scanId);
 
+  const aggOutputFile = path.join(auditDir, '10-summary-report.md');
   const aggResult = await runClaudeAgentic(
     `You are creating the final Security Audit Report for the "${platformName}" platform.
 
-Combine the following ${SECURITY_AGENTS.length} security agent reports into ONE structured report.
+Combine the following ${successfulResults.length} security agent reports into ONE structured report (${failedResults.length > 0 ? `${failedResults.length} agents failed and are excluded` : 'all agents succeeded'}).
 
 REPOS: ${repos.join(', ')}
 
@@ -482,7 +532,13 @@ If an agent did NOT include a Coverage Report → mark "⚠️ Missing" and flag
 
 AGENT RESULTS:
 
-${agentResults}${failedNote}`,
+${agentResults}${failedNote}
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE aggregated report to this file: ${aggOutputFile}
+2. Do NOT write files to any other location.
+3. The file must contain your FULL report with all findings, not just a summary.
+4. Your text response should be a brief summary only — the detailed report goes in the file.`,
     workingDir,
     600000,
     model
@@ -490,39 +546,31 @@ ${agentResults}${failedNote}`,
 
   totalCost += aggResult.cost;
   const duration = Math.round((Date.now() - startTime) / 1000);
-  const report = aggResult.success ? aggResult.result : agentResults;
 
-  // ── Save all reports to numbered audit folder ──
-  const platformSlug = platformName.toLowerCase().replace(/\s+/g, '-');
-  const platformAuditsDir = path.join(getAuditsDir(), 'security-audits', platformSlug);
-  if (!fs.existsSync(platformAuditsDir)) fs.mkdirSync(platformAuditsDir, { recursive: true });
+  // Prefer file output for aggregation (can be very large)
+  let report = aggResult.success ? aggResult.result : agentResults;
+  if (fs.existsSync(aggOutputFile)) {
+    const fileContent = fs.readFileSync(aggOutputFile, 'utf8');
+    if (fileContent.length > report.length) {
+      logAndBroadcast(`  [Security] 📄 Aggregation: using file output (${fileContent.length} chars) over result text (${report.length} chars)`);
+      report = fileContent;
+    }
+  }
 
-  // Determine next audit number (01, 02, 03, ...)
-  const existingAudits = fs.readdirSync(platformAuditsDir)
-    .filter(f => f.match(/^\d{2}-audit-/))
-    .sort();
-  const nextNum = existingAudits.length + 1;
-  const numStr = String(nextNum).padStart(2, '0');
-
-  const now = new Date();
-  const dateTimeStr = `${now.toISOString().split('T')[0]}_${now.toTimeString().slice(0, 8).replace(/:/g, '-')}`;
-  const auditFolderName = `${numStr}-audit-${dateTimeStr}`;
-  const auditDir = path.join(platformAuditsDir, auditFolderName);
-  fs.mkdirSync(auditDir, { recursive: true });
-
-  // Save architecture map
-  fs.writeFileSync(path.join(auditDir, '00-architecture-map.md'), architectureMap);
-
-  // Save individual agent results
+  // ── Save final reports to audit folder (already created before Phase 1) ──
+  // Agent files were either written by agents directly or we write them now
   for (const r of results) {
     const agentFile = path.join(auditDir, `${r.agent.id}.md`);
-    fs.writeFileSync(agentFile, `# ${r.agent.name}\n\n${r.result.result}`);
+    // Only overwrite if agent didn't write a file (or wrote a smaller one)
+    if (!fs.existsSync(agentFile) || fs.readFileSync(agentFile, 'utf8').length < (r.result.result || '').length) {
+      fs.writeFileSync(agentFile, `# ${r.agent.name}\n\n${r.result.result}`);
+    }
   }
 
   // Save full combined report (all agents)
   fs.writeFileSync(path.join(auditDir, '09-full-report.md'), fullReport);
 
-  // Save aggregated summary report
+  // Save aggregated summary report (may already exist from agent file-output)
   const reportFile = path.join(auditDir, '10-summary-report.md');
   fs.writeFileSync(reportFile, report);
 

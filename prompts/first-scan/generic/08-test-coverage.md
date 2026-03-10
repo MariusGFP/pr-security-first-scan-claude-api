@@ -44,7 +44,7 @@ Analyze the FULL CODEBASE for test coverage gaps and testing best practices. Thi
 - API tests: present? quality?
 
 ## Framework-Specific Testing
-- Are framework testing utilities used? (e.g., Laravel's TestCase, testing helpers)
+- Are framework testing utilities used? (e.g., {{FRAMEWORK_NAME}}'s TestCase, testing helpers)
 - Are database factories/fixtures used for test data?
 - Is the testing database properly configured?
 

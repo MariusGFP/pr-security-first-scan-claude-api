@@ -8,7 +8,25 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-const PROMPTS_DIR = path.join(process.cwd(), 'prompts', 'first-scan');
+const PROMPTS_BASE_DIR = path.join(process.cwd(), 'prompts', 'first-scan');
+
+// ── Framework Presets ──
+// Each preset maps to a prompt directory under prompts/first-scan/<dir>/
+const FRAMEWORK_PRESETS: Record<string, { name: string; promptDir: string }> = {
+  'laravel-vue': { name: 'Laravel 12 + Blade + Vue', promptDir: 'laravel' },
+  'nodejs-react': { name: 'Node.js + React', promptDir: 'nodejs-react' },
+  'generic': { name: 'Auto-Detect (Generic)', promptDir: 'generic' },
+};
+
+function getPromptsDir(framework: string): string {
+  const preset = FRAMEWORK_PRESETS[framework];
+  if (preset) {
+    const dir = path.join(PROMPTS_BASE_DIR, preset.promptDir);
+    if (fs.existsSync(dir)) return dir;
+  }
+  // Fallback to generic
+  return path.join(PROMPTS_BASE_DIR, 'generic');
+}
 
 function getAuditsDir(): string {
   const fromKeys = getKeyValue('AUDITS_DIR');
@@ -36,35 +54,36 @@ function resolveRepoDir(repo: { id: number; name: string; org: string; local_pat
   return null;
 }
 
-// First Scan agent definitions (code quality focused, not security)
+// First Scan agent definitions — overlap-free responsibilities
 const SCAN_AGENTS = [
-  { id: '01-code-quality',      name: 'Code Quality',      focus: 'Code smells, duplication, complexity, style inconsistencies, naming',                              deep: true },
-  { id: '02-bug-analysis',      name: 'Bug Analysis',      focus: 'Logic errors, edge cases, race conditions, runtime errors, error handling',                        deep: true },
-  { id: '03-security',          name: 'Security',          focus: 'XSS, injection, insecure API calls, missing input validation, auth issues',                        deep: true },
-  { id: '04-best-practices',    name: 'Best Practices',    focus: 'Framework patterns, conventions, anti-patterns, SOLID principles',                                 deep: true },
-  { id: '05-dead-code',         name: 'Dead Code',         focus: 'Unused imports, variables, functions, unreachable code, deprecated code',                           deep: false },
-  { id: '06-behavioral-impact', name: 'Behavioral Impact', focus: 'UI bugs, state issues, rendering problems, UX inconsistencies, data integrity',                    deep: true },
-  { id: '07-performance',       name: 'Performance',       focus: 'N+1 queries, missing indexes, caching, lazy loading, memory leaks',                                deep: true },
-  { id: '08-test-coverage',     name: 'Test Coverage',     focus: 'Missing tests, untested paths, test quality, test suggestions',                                    deep: false },
-  { id: '09-dependency-check',  name: 'Dependencies',      focus: 'Outdated packages, CVEs, unnecessary dependencies, license issues',                                deep: false },
-  { id: '10-ai-code-safety',    name: 'AI Code Safety',    focus: 'Hallucinated APIs, fake implementations, copy-paste errors, inconsistent auth, missing validation', deep: false },
+  { id: '01-code-quality',      name: 'Code Quality',           focus: 'Naming, readability, duplication, complexity metrics, style consistency',                                   deep: true },
+  { id: '02-bug-analysis',      name: 'Bug Analysis',           focus: 'Logic errors, null/type issues, off-by-one, race conditions, unhandled exceptions',                         deep: true },
+  { id: '03-security',          name: 'Security',               focus: 'ALL security: injection, XSS, CSRF, auth consistency, mass assignment, input validation, data exposure',     deep: true },
+  { id: '04-best-practices',    name: 'Framework Patterns',     focus: 'Framework-specific patterns, architecture, layer separation, SOLID, DI, conventions',                       deep: true },
+  { id: '05-dead-code',         name: 'Dead Code',              focus: 'Unused imports, variables, functions, unreachable code, deprecated code, framework-aware detection',         deep: false },
+  { id: '06-behavioral-impact', name: 'Behavioral Impact',      focus: 'API response consistency, validation UX, queue/job reliability, data integrity, state consistency',          deep: true },
+  { id: '07-performance',       name: 'Performance',            focus: 'N+1 queries, missing indexes/eager loading, caching, memory leaks, query optimization',                     deep: true },
+  { id: '08-test-coverage',     name: 'Test Coverage',          focus: 'Missing tests, untested critical paths, test quality, test suggestions',                                    deep: false },
+  { id: '09-dependency-check',  name: 'Dependencies',           focus: 'Outdated packages, CVEs, unnecessary dependencies, license issues',                                        deep: false },
+  { id: '10-ai-code-safety',    name: 'AI Code Safety',         focus: 'Hallucinated APIs, fake implementations, copy-paste errors, over-engineering, inconsistent patterns',        deep: false },
 ];
 
 /**
  * Pre-flight checks before starting a first scan.
  * Returns an array of error messages. Empty = all checks passed.
  */
-function runPreFlightChecks(repoDir: string): string[] {
+function runPreFlightChecks(repoDir: string, framework: string): string[] {
   const errors: string[] = [];
 
-  // 1. Check prompt files exist
-  const detectionPrompt = path.join(PROMPTS_DIR, '00-framework-detection.md');
+  // 1. Check prompt files exist for selected framework
+  const promptsDir = getPromptsDir(framework);
+  const detectionPrompt = path.join(promptsDir, '00-framework-detection.md');
   if (!fs.existsSync(detectionPrompt)) {
-    errors.push(`Prompt-Dateien nicht gefunden: ${PROMPTS_DIR} existiert nicht`);
+    errors.push(`Prompt-Dateien nicht gefunden: ${promptsDir} existiert nicht`);
   } else {
     const missingPrompts = SCAN_AGENTS
       .map(a => a.id)
-      .filter(id => !fs.existsSync(path.join(PROMPTS_DIR, `${id}.md`)));
+      .filter(id => !fs.existsSync(path.join(promptsDir, `${id}.md`)));
     if (missingPrompts.length > 0) {
       errors.push(`Fehlende Agent-Prompts: ${missingPrompts.join(', ')}`);
     }
@@ -122,6 +141,7 @@ interface CodeModule {
   name: string;
   dirs: string[];
   lines: number;
+  files: string[];  // All source files in this module (relative to repoDir)
 }
 
 const SKIP_DIRS = new Set([
@@ -130,14 +150,58 @@ const SKIP_DIRS = new Set([
 ]);
 
 const CODE_EXTENSIONS = new Set([
+  // Primary code
   '.ts', '.tsx', '.js', '.jsx', '.php', '.py', '.rb', '.java', '.go',
   '.rs', '.vue', '.svelte', '.cs', '.swift', '.kt', '.scala', '.ex', '.exs',
+  // Templates & markup
+  '.twig', '.hbs', '.ejs', '.pug',
+]);
+
+// Config files: included in manifest (for dependency/security audits) but excluded from coverage %
+const CONFIG_EXTENSIONS = new Set([
+  '.json', '.yaml', '.yml', '.xml', '.toml',
+]);
+
+// Combined set for file collection
+const ALL_SCANNABLE_EXTENSIONS = new Set([...CODE_EXTENSIONS, ...CONFIG_EXTENSIONS]);
+
+// Files to exclude even if their extension matches (lock files, generated files)
+const SKIP_FILES = new Set([
+  'package-lock.json', 'composer.lock', 'yarn.lock', 'pnpm-lock.yaml',
+  'bun.lockb', 'Gemfile.lock', 'poetry.lock', 'Cargo.lock',
+  'phpunit.xml.dist', '.phpunit.result.cache',
 ]);
 
 function countLines(filePath: string): number {
   try {
-    return fs.readFileSync(filePath, 'utf8').split('\n').length;
+    const buf = fs.readFileSync(filePath);
+    let count = 1;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] === 0x0A) count++;
+    }
+    return count;
   } catch { return 0; }
+}
+
+/**
+ * Collect all source files in a directory recursively.
+ * Returns paths relative to repoDir.
+ */
+function collectSourceFiles(dirPath: string, repoDir: string): string[] {
+  const files: string[] = [];
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...collectSourceFiles(fullPath, repoDir));
+      } else if (ALL_SCANNABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && !SKIP_FILES.has(entry.name)) {
+        files.push(path.relative(repoDir, fullPath));
+      }
+    }
+  } catch { /* ignore */ }
+  return files;
 }
 
 function countDirLines(dirPath: string): number {
@@ -149,7 +213,7 @@ function countDirLines(dirPath: string): number {
       const fullPath = path.join(dirPath, entry.name);
       if (entry.isDirectory()) {
         total += countDirLines(fullPath);
-      } else if (CODE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+      } else if (ALL_SCANNABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && !SKIP_FILES.has(entry.name)) {
         total += countLines(fullPath);
       }
     }
@@ -171,7 +235,7 @@ function discoverModules(repoDir: string): CodeModule[] {
   // Also count root-level files
   let rootLines = 0;
   for (const entry of entries) {
-    if (entry.isFile() && CODE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+    if (entry.isFile() && ALL_SCANNABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && !SKIP_FILES.has(entry.name)) {
       rootLines += countLines(path.join(repoDir, entry.name));
     }
   }
@@ -182,13 +246,14 @@ function discoverModules(repoDir: string): CodeModule[] {
 
   // If small repo (<15k lines) or few dirs, no splitting needed
   if (totalLines < 15000 || dirStats.length <= 2) {
-    return [{ name: 'full-repo', dirs: ['.'], lines: totalLines }];
+    const allFiles = collectSourceFiles(repoDir, repoDir);
+    return [{ name: 'full-repo', dirs: ['.'], lines: totalLines, files: allFiles }];
   }
 
   // Target: 3-5 modules, each 15k-60k lines
   const TARGET_MODULE_LINES = Math.max(15000, Math.ceil(totalLines / 5));
   const modules: CodeModule[] = [];
-  let currentModule: CodeModule = { name: '', dirs: [], lines: 0 };
+  let currentModule: CodeModule = { name: '', dirs: [], lines: 0, files: [] };
 
   for (const dir of dirStats) {
     // Large dir becomes its own module
@@ -196,33 +261,44 @@ function discoverModules(repoDir: string): CodeModule[] {
       if (currentModule.dirs.length > 0) {
         currentModule.name = currentModule.dirs.length === 1 ? currentModule.dirs[0] : currentModule.dirs.slice(0, 2).join('+');
         modules.push(currentModule);
-        currentModule = { name: '', dirs: [], lines: 0 };
+        currentModule = { name: '', dirs: [], lines: 0, files: [] };
       }
-      modules.push({ name: dir.name, dirs: [dir.name], lines: dir.lines });
+      const dirFiles = collectSourceFiles(path.join(repoDir, dir.name), repoDir);
+      modules.push({ name: dir.name, dirs: [dir.name], lines: dir.lines, files: dirFiles });
       continue;
     }
 
     // Accumulate smaller dirs into one module
     currentModule.dirs.push(dir.name);
     currentModule.lines += dir.lines;
+    currentModule.files.push(...collectSourceFiles(path.join(repoDir, dir.name), repoDir));
 
     if (currentModule.lines >= TARGET_MODULE_LINES) {
       currentModule.name = currentModule.dirs.length === 1 ? currentModule.dirs[0] : currentModule.dirs.slice(0, 2).join('+');
       modules.push(currentModule);
-      currentModule = { name: '', dirs: [], lines: 0 };
+      currentModule = { name: '', dirs: [], lines: 0, files: [] };
     }
   }
 
   // Add remaining dirs + root files
   if (currentModule.dirs.length > 0 || rootLines > 0) {
-    if (rootLines > 0) currentModule.dirs.push('.');
+    if (rootLines > 0) {
+      currentModule.dirs.push('.');
+      // Collect root-level files only
+      for (const entry of entries) {
+        if (entry.isFile() && ALL_SCANNABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && !SKIP_FILES.has(entry.name)) {
+          currentModule.files.push(entry.name);
+        }
+      }
+    }
     currentModule.lines += rootLines;
     currentModule.name = currentModule.dirs.length === 1 ? currentModule.dirs[0] : currentModule.dirs.slice(0, 2).join('+');
     if (modules.length > 0) {
       modules.push(currentModule);
     } else {
       // Only small dirs, single module
-      modules.push({ name: 'full-repo', dirs: ['.'], lines: totalLines });
+      const allFiles = collectSourceFiles(repoDir, repoDir);
+      modules.push({ name: 'full-repo', dirs: ['.'], lines: totalLines, files: allFiles });
     }
   }
 
@@ -232,6 +308,7 @@ function discoverModules(repoDir: string): CodeModule[] {
     const smallest = modules.shift()!;
     modules[0].dirs.push(...smallest.dirs);
     modules[0].lines += smallest.lines;
+    modules[0].files.push(...smallest.files);
     modules[0].name = modules[0].dirs.slice(0, 2).join('+');
   }
 
@@ -266,7 +343,7 @@ function ensureScanColumns() {
 
 export async function GET() {
   ensureScanColumns();
-  // Return available models + recent scans for the UI
+  // Return available models, framework presets, and recent scans for the UI
   const models = Object.entries(AVAILABLE_MODELS).map(([key, val]) => ({
     key,
     name: val.name,
@@ -274,13 +351,18 @@ export async function GET() {
     costPer1MInput: val.costPer1MInput,
     costPer1MOutput: val.costPer1MOutput,
   }));
-  return NextResponse.json({ models });
+  const frameworks = Object.entries(FRAMEWORK_PRESETS).map(([key, val]) => ({
+    key,
+    name: val.name,
+  }));
+  return NextResponse.json({ models, frameworks });
 }
 
 export async function POST(req: NextRequest) {
   ensureScanColumns();
-  const { repoId, model } = await req.json();
+  const { repoId, model, framework } = await req.json();
   const selectedModel: ModelKey = (model && model in AVAILABLE_MODELS) ? model : 'sonnet';
+  const selectedFramework: string = (framework && framework in FRAMEWORK_PRESETS) ? framework : 'generic';
 
   const repo = getRepoById(repoId);
   if (!repo) return NextResponse.json({ error: 'Repo not found' }, { status: 404 });
@@ -291,7 +373,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Pre-flight checks
-  const preFlightErrors = runPreFlightChecks(repoDir);
+  const preFlightErrors = runPreFlightChecks(repoDir, selectedFramework);
   if (preFlightErrors.length > 0) {
     return NextResponse.json({
       error: 'Pre-Flight-Check fehlgeschlagen',
@@ -307,27 +389,34 @@ export async function POST(req: NextRequest) {
   ).run(repoId, SCAN_AGENTS.length, selectedModel);
   const scanId = result.lastInsertRowid as number;
 
-  logAndBroadcast(`🔍 First Scan started for ${repo.full_name} with ${modelInfo.name} (${modelInfo.context}, agentic mode, ${SCAN_AGENTS.length} agents)...`);
+  const frameworkName = FRAMEWORK_PRESETS[selectedFramework]?.name || 'Auto-Detect';
+  logAndBroadcast(`🔍 First Scan started for ${repo.full_name} with ${modelInfo.name} (${frameworkName}, ${SCAN_AGENTS.length} agents)...`);
 
   // Run scan asynchronously
-  runFullScan(scanId, repo.id, repo.name, repo.full_name, repoDir, selectedModel).catch(e => {
-    logAndBroadcast(`❌ First Scan failed: ${e.message}`);
+  runFullScan(scanId, repo.id, repo.name, repo.full_name, repoDir, selectedModel, selectedFramework).catch(e => {
+    const errMsg = e instanceof Error ? e.message : String(e);
+    const errStack = e instanceof Error ? e.stack : '';
+    logAndBroadcast(`❌ First Scan failed: ${errMsg}`);
+    if (errStack) console.error(`[First Scan] Stack trace for scan ${scanId}:\n${errStack}`);
     getDb().prepare('UPDATE scans SET status = ? WHERE id = ?').run('failed', scanId);
   });
 
-  return NextResponse.json({ scanId, status: 'started', model: selectedModel });
+  return NextResponse.json({ scanId, status: 'started', model: selectedModel, framework: selectedFramework });
 }
 
 async function runFullScan(
-  scanId: number, repoId: number, repoName: string, repoFullName: string, repoDir: string, model: ModelKey
+  scanId: number, repoId: number, repoName: string, repoFullName: string, repoDir: string, model: ModelKey, framework: string
 ) {
   const startTime = Date.now();
   let totalCost = 0;
   let aborted = false;
   const modelInfo = AVAILABLE_MODELS[model];
   const AGENT_TIMEOUT = 600000;    // 10 min per agent
-  const MAX_COST_USD = 50;         // Hard cost limit
   const MAX_SCAN_DURATION_MS = 45 * 60 * 1000; // 45 min total
+  const promptsDir = getPromptsDir(framework);
+  const frameworkName = FRAMEWORK_PRESETS[framework]?.name || 'Auto-Detect';
+
+  logAndBroadcast(`  [Scan] Using ${frameworkName} prompts from: ${path.basename(promptsDir)}/`);
 
   // Build initial agent status list
   const agentStatus: Array<{ id: string; name: string; status: string; chars?: number; cost?: number; attempt?: number; subAgents?: number }> =
@@ -337,7 +426,7 @@ async function runFullScan(
   logAndBroadcast(`  [Scan] Phase 0: Framework Detection & Architecture Mapping (${modelInfo.name})...`);
   broadcastScanProgress(scanId, { phase: 'mapping', agents: agentStatus });
 
-  const detectionPromptFile = path.join(PROMPTS_DIR, '00-framework-detection.md');
+  const detectionPromptFile = path.join(promptsDir, '00-framework-detection.md');
   let detectionPrompt = fs.existsSync(detectionPromptFile) ? fs.readFileSync(detectionPromptFile, 'utf8') : '';
   detectionPrompt = detectionPrompt
     .replace(/\{\{REPO_NAME\}\}/g, repoFullName)
@@ -346,34 +435,77 @@ async function runFullScan(
   const claudeMdPath = path.join(repoDir, 'CLAUDE.md');
   const claudeMd = fs.existsSync(claudeMdPath) ? fs.readFileSync(claudeMdPath, 'utf8').substring(0, 3000) : '';
 
+  // Ensure audits base dir exists for detection output file
+  const detectionOutputDir = path.join(getAuditsDir(), 'code-audits');
+  if (!fs.existsSync(detectionOutputDir)) fs.mkdirSync(detectionOutputDir, { recursive: true });
+  const detectionOutputFile = path.join(detectionOutputDir, `_detection-${scanId}.md`);
+
   const detectionResult = await runClaudeAgentic(
-    `${detectionPrompt}\n\nRepository path: ${repoDir}\n\n${claudeMd ? `Existing CLAUDE.md content:\n${claudeMd}` : 'No CLAUDE.md found — detect everything from source.'}`,
+    `${detectionPrompt}\n\nRepository path: ${repoDir}\n\n${claudeMd ? `Existing CLAUDE.md content:\n${claudeMd}` : 'No CLAUDE.md found — detect everything from source.'}
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE framework detection and architecture map to this file: ${detectionOutputFile}
+2. Do NOT write files to any other location.
+3. Your text response should be a brief summary only — the detailed map goes in the file.`,
     repoDir,
     AGENT_TIMEOUT,
     model
   );
 
   totalCost += detectionResult.cost;
-  const architectureMap = detectionResult.success ? detectionResult.result : 'Framework detection failed — proceed without context.';
+
+  // Prefer file output over result text
+  let architectureMap = detectionResult.success ? detectionResult.result : 'Framework detection failed — proceed without context.';
+  if (fs.existsSync(detectionOutputFile)) {
+    const fileContent = fs.readFileSync(detectionOutputFile, 'utf8');
+    if (fileContent.length > architectureMap.length) {
+      logAndBroadcast(`  [Scan] 📄 Framework Detection: using file output (${fileContent.length} chars) over result text (${architectureMap.length} chars)`);
+      architectureMap = fileContent;
+    }
+    try { fs.unlinkSync(detectionOutputFile); } catch { /* ignore */ }
+  }
   const frameworkInfo = extractFrameworkSummary(architectureMap);
   logAndBroadcast(`  [Scan] ✅ Framework Detection done — ${frameworkInfo} ($${detectionResult.cost.toFixed(2)})`);
 
   getDb().prepare('UPDATE scans SET architecture_map = ?, framework_info = ? WHERE id = ?')
     .run(architectureMap, frameworkInfo, scanId);
 
-  // ── Phase 0.5: Module Discovery ──
+  // ── Phase 0.5: Module Discovery & File Manifest ──
   const modules = discoverModules(repoDir);
   const totalLines = modules.reduce((s, m) => s + m.lines, 0);
+  const allSourceFiles = new Set(modules.flatMap(m => m.files));
+  const totalFiles = allSourceFiles.size;
   const useSubAgents = modules.length > 1;
 
   if (useSubAgents) {
-    logAndBroadcast(`  [Scan] Module Split: ${modules.length} modules detected (${totalLines.toLocaleString()} lines total)`);
+    logAndBroadcast(`  [Scan] Module Split: ${modules.length} modules, ${totalFiles} files (${totalLines.toLocaleString()} lines total)`);
     for (const mod of modules) {
-      logAndBroadcast(`    → ${mod.name}: ${mod.dirs.join(', ')} (${mod.lines.toLocaleString()} lines)`);
+      logAndBroadcast(`    → ${mod.name}: ${mod.dirs.join(', ')} (${mod.files.length} files, ${mod.lines.toLocaleString()} lines)`);
     }
   } else {
-    logAndBroadcast(`  [Scan] Single-module repo (${totalLines.toLocaleString()} lines) — no sub-agent splitting`);
+    logAndBroadcast(`  [Scan] Single-module repo (${totalFiles} files, ${totalLines.toLocaleString()} lines) — no sub-agent splitting`);
   }
+
+  // ── Create audit directory BEFORE agents run (so agents can write files there) ──
+  const repoSlug = repoFullName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const repoAuditsDir = path.join(getAuditsDir(), 'code-audits', repoSlug);
+  if (!fs.existsSync(repoAuditsDir)) fs.mkdirSync(repoAuditsDir, { recursive: true });
+
+  const now = new Date();
+  const dateTimeStr = now.toISOString().replace(/[:.]/g, '-');
+  const auditFolderName = `scan-${dateTimeStr}-${scanId}`;
+  const auditDir = path.join(repoAuditsDir, auditFolderName);
+  fs.mkdirSync(auditDir, { recursive: true });
+
+  // Save architecture/framework detection
+  fs.writeFileSync(path.join(auditDir, '00-framework-detection.md'), architectureMap);
+
+  // Save file manifest for coverage tracking
+  const manifestContent = modules.map(m =>
+    `## Module: ${m.name} (${m.files.length} files)\n${m.files.map(f => `- ${f}`).join('\n')}`
+  ).join('\n\n');
+  fs.writeFileSync(path.join(auditDir, '00-file-manifest.md'), `# File Manifest\nTotal: ${totalFiles} source files\n\n${manifestContent}`);
+  logAndBroadcast(`  [Scan] 📁 Audit folder: ${auditDir}`);
 
   // ── Phase 1: Run agents (with sub-agents for deep agents on large repos) ──
   const deepAgentCount = SCAN_AGENTS.filter(a => a.deep).length;
@@ -389,8 +521,15 @@ async function runFullScan(
   const MIN_OUTPUT_CHARS = 500;
   const RETRY_DELAY_MS = 30000;
 
+  // Pre-compute holistic manifest block once (used by all holistic agents)
+  const allFilesList = Array.from(allSourceFiles);
+  const MAX_INLINE_FILES_HOLISTIC = 300;
+  const holisticManifestBlock = allFilesList.length <= MAX_INLINE_FILES_HOLISTIC
+    ? `\n📋 FILE MANIFEST (${allFilesList.length} files in this repo):\n${allFilesList.map(f => `- ${f}`).join('\n')}`
+    : `\n📋 FILE MANIFEST (${allFilesList.length} files — full list in: ${path.join(auditDir, '00-file-manifest.md')}):\nFirst ${MAX_INLINE_FILES_HOLISTIC} files:\n${allFilesList.slice(0, MAX_INLINE_FILES_HOLISTIC).map(f => `- ${f}`).join('\n')}\n... and ${allFilesList.length - MAX_INLINE_FILES_HOLISTIC} more (see manifest file)`;
+
   const agentPromises = SCAN_AGENTS.map(async (agent, idx) => {
-    const promptFile = path.join(PROMPTS_DIR, `${agent.id}.md`);
+    const promptFile = path.join(promptsDir, `${agent.id}.md`);
     let basePrompt = '';
     if (fs.existsSync(promptFile)) {
       basePrompt = fs.readFileSync(promptFile, 'utf8');
@@ -416,6 +555,18 @@ async function runFullScan(
 
       const subPromises = modules.map(mod => {
         const dirsList = mod.dirs.map(d => d === '.' ? repoDir : path.join(repoDir, d)).join(', ');
+        const safeModName = mod.name.replace(/[^a-zA-Z0-9_-]+/g, '-');
+        const subOutputFile = path.join(auditDir, `${agent.id}-${safeModName}.md`);
+
+        // Build file manifest for this module (cap at 200 inline, reference manifest file for larger)
+        const MAX_INLINE_FILES = 200;
+        let fileManifestBlock: string;
+        if (mod.files.length <= MAX_INLINE_FILES) {
+          fileManifestBlock = `\n📋 FILE MANIFEST (${mod.files.length} files — you MUST review ALL of these):\n${mod.files.map(f => `- ${f}`).join('\n')}`;
+        } else {
+          fileManifestBlock = `\n📋 FILE MANIFEST (${mod.files.length} files — you MUST review ALL of these):\nFirst ${MAX_INLINE_FILES} files listed here, full list in: ${path.join(auditDir, '00-file-manifest.md')}\n${mod.files.slice(0, MAX_INLINE_FILES).map(f => `- ${f}`).join('\n')}\n... and ${mod.files.length - MAX_INLINE_FILES} more (see manifest file)`;
+        }
+
         const subPrompt = `${basePrompt}
 
 CONTEXT: This is a FULL CODEBASE first scan (NOT a PR review, NOT a diff review).
@@ -427,9 +578,10 @@ Your Focus: ${agent.focus}
 ⚠️ MODULE ASSIGNMENT: You are Sub-Agent for module "${mod.name}".
 Focus ONLY on files in these directories: ${dirsList}
 Do NOT analyze files outside your assigned directories.
+${fileManifestBlock}
 
 Analyze ALL source files in your assigned directories thoroughly.
-Read relevant files — start with the directory structure then dive into details.
+Read EVERY file from the manifest above — start with the directory structure then dive into each file.
 Begin your report with: ## ${agent.name} — Module: ${mod.name}
 
 Format per finding:
@@ -438,32 +590,63 @@ Format per finding:
 - **File:Line**: Description
 - **Fix Suggestion**: Concrete code
 
-End with a Coverage Report listing ALL files you reviewed.
-If no issues found: "✅ No ${agent.name} issues found in ${mod.name}."`;
+End with a MANDATORY Coverage Report:
+### Coverage Report
+**Files reviewed**: X / ${mod.files.length}
+**Files with findings**: [list]
+**Files reviewed, no issues**: [list]
+**Files NOT reviewed**: [list — MUST be empty for a complete audit]
+If no issues found: "✅ No ${agent.name} issues found in ${mod.name}."
 
-        return runClaudeAgentic(subPrompt, repoDir, AGENT_TIMEOUT, model);
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE report to this file: ${subOutputFile}
+2. Do NOT write files to any other location. No docs/, no Desktop/, no other folders.
+3. The file must contain your FULL detailed analysis with all findings, not just a summary.
+4. Your text response should be a brief summary only — the detailed report goes in the file.`;
+
+        return { promise: runClaudeAgentic(subPrompt, repoDir, AGENT_TIMEOUT, model), outputFile: subOutputFile };
       });
 
-      const subResults = await Promise.all(subPromises);
+      const subResults = await Promise.all(subPromises.map(s => s.promise));
       let agentCost = 0;
       const subOutputs: string[] = [];
+      let successfulSubCount = 0;
 
       for (let i = 0; i < subResults.length; i++) {
-        const sub = subResults[i];
+        let sub = subResults[i];
         agentCost += sub.cost;
         totalCost += sub.cost;
+
+        // Check if sub-agent wrote a file (preferred over result text)
+        const subFile = subPromises[i].outputFile;
+        if (fs.existsSync(subFile)) {
+          const fileContent = fs.readFileSync(subFile, 'utf8');
+          if (fileContent.length > (sub.result || '').length) {
+            logAndBroadcast(`    [${agent.id}] 📄 Sub-agent ${modules[i].name}: using file output (${fileContent.length} chars)`);
+            const fileSuccess = sub.success || fileContent.length >= MIN_OUTPUT_CHARS;
+            sub = { ...sub, result: fileContent, success: fileSuccess };
+          }
+        }
+
         if (sub.success) {
           subOutputs.push(sub.result);
+          successfulSubCount++;
         } else {
-          subOutputs.push(`## ${agent.name} — Module: ${modules[i].name}\n❌ Sub-agent failed: ${sub.result.substring(0, 200)}`);
+          subOutputs.push(`## ${agent.name} — Module: ${modules[i].name}\n❌ Sub-agent failed: ${(sub.result || '').substring(0, 200)}`);
         }
+      }
+
+      // Check safety limits after sub-agents
+      if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
+        logAndBroadcast(`  [Scan] 🛑 TIME LIMIT reached (${Math.round((Date.now() - startTime) / 60000)}min). Remaining agents will be skipped.`);
+        aborted = true;
       }
 
       // Merge sub-agent results
       let mergedResult = subOutputs.join('\n\n---\n\n');
 
-      // If >2 sub-agents, do a per-agent merge to deduplicate
-      if (modules.length > 2) {
+      // If >2 sub-agents, do a per-agent merge to deduplicate (skip if aborted)
+      if (modules.length > 2 && !aborted) {
         logAndBroadcast(`    [${agent.id}] Merging ${modules.length} sub-agent results...`);
         const mergeResult = await runClaudeAgentic(
           `Merge the following ${modules.length} sub-agent reports for the ${agent.name} analysis of ${repoFullName}.
@@ -484,14 +667,23 @@ ${mergedResult}`,
       }
 
       const outputLen = mergedResult.length;
-      logAndBroadcast(`  [Scan] ✅ ${agent.name} done (${modules.length} sub-agents, ${outputLen} chars, $${agentCost.toFixed(2)})`);
-      agentStatus[idx] = { ...agentStatus[idx], status: 'done', chars: outputLen, cost: agentCost, subAgents: modules.length };
+      const deepSuccess = successfulSubCount > 0 && outputLen >= MIN_OUTPUT_CHARS;
+
+      if (deepSuccess) {
+        logAndBroadcast(`  [Scan] ✅ ${agent.name} done (${successfulSubCount}/${modules.length} sub-agents, ${outputLen} chars, $${agentCost.toFixed(2)})`);
+        agentStatus[idx] = { ...agentStatus[idx], status: 'done', chars: outputLen, cost: agentCost, subAgents: modules.length };
+      } else {
+        logAndBroadcast(`  [Scan] ❌ ${agent.name} FAILED (${successfulSubCount}/${modules.length} sub-agents succeeded, ${outputLen} chars)`);
+        agentStatus[idx] = { ...agentStatus[idx], status: 'failed', chars: outputLen, cost: agentCost, subAgents: modules.length };
+      }
       broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
 
-      return { agent, result: { success: true, result: mergedResult, cost: agentCost, durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
+      return { agent, result: { success: deepSuccess, result: mergedResult, cost: agentCost, durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
     }
 
     // ── Holistic agents (single agent, full repo) ──
+    const outputFile = path.join(auditDir, `${agent.id}.md`);
+
     const fullPrompt = `${basePrompt}
 
 CONTEXT: This is a FULL CODEBASE first scan (NOT a PR review, NOT a diff review).
@@ -499,9 +691,10 @@ Repository: ${repoFullName}
 Path: ${repoDir}
 Framework: ${frameworkInfo}
 Your Focus: ${agent.focus}
+${holisticManifestBlock}
 
 Analyze the ENTIRE codebase. You have full access to ALL files.
-Read relevant files — start with the project structure then dive into details.
+Read relevant files from the manifest above — start with the project structure then dive into details.
 Begin your report with: ## ${agent.name}
 
 Format per finding:
@@ -510,7 +703,20 @@ Format per finding:
 - **File:Line**: Description
 - **Fix Suggestion**: Concrete code
 
-If no issues found: "✅ No ${agent.name} issues found."`;
+If no issues found: "✅ No ${agent.name} issues found."
+
+End with a MANDATORY Coverage Report:
+### Coverage Report
+**Files reviewed**: X / ${totalFiles}
+**Files with findings**: [list]
+**Files reviewed, no issues**: [list]
+**Files NOT reviewed**: [list — should be empty for a complete audit, or explain why skipped]
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE report to this file: ${outputFile}
+2. Do NOT write files to any other location. No docs/, no Desktop/, no other folders.
+3. The file must contain your FULL detailed analysis with all findings, not just a summary.
+4. Your text response should be a brief summary only — the detailed report goes in the file.`;
 
     // Check safety limits before starting
     if (aborted) {
@@ -521,11 +727,7 @@ If no issues found: "✅ No ${agent.name} issues found."`;
     let result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, model);
     totalCost += result.cost;
 
-    // Check limits after each agent
-    if (totalCost > MAX_COST_USD) {
-      logAndBroadcast(`  [Scan] 🛑 COST LIMIT ($${totalCost.toFixed(2)} > $${MAX_COST_USD}). Remaining agents skipped.`);
-      aborted = true;
-    }
+    // Check time limit after each agent
     if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
       logAndBroadcast(`  [Scan] 🛑 TIME LIMIT (${Math.round((Date.now() - startTime) / 60000)}min). Remaining agents skipped.`);
       aborted = true;
@@ -542,16 +744,29 @@ If no issues found: "✅ No ${agent.name} issues found."`;
       result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, model);
       totalCost += result.cost;
 
-      if (totalCost > MAX_COST_USD || Date.now() - startTime > MAX_SCAN_DURATION_MS) {
-        logAndBroadcast(`  [Scan] 🛑 Safety limit reached during retry. Stopping retries for ${agent.name}.`);
+      if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
+        logAndBroadcast(`  [Scan] 🛑 Time limit reached during retry. Stopping retries for ${agent.name}.`);
         aborted = true;
+      }
+    }
+
+    // Check if agent wrote a file (preferred) — use file content over result text
+    if (fs.existsSync(outputFile)) {
+      const fileContent = fs.readFileSync(outputFile, 'utf8');
+      if (fileContent.length > (result.result || '').length) {
+        logAndBroadcast(`  [Scan] 📄 ${agent.name}: using file output (${fileContent.length} chars) over result text (${(result.result || '').length} chars)`);
+        const fileSuccess = result.success || fileContent.length >= MIN_OUTPUT_CHARS;
+        result = { ...result, result: fileContent, success: fileSuccess };
       }
     }
 
     const outputLen = (result.result || '').length;
     if (!result.success) {
-      logAndBroadcast(`  [Scan] ❌ ${agent.name} FAILED after ${attempt} attempts: ${result.result.substring(0, 200)}`);
+      logAndBroadcast(`  [Scan] ❌ ${agent.name} FAILED after ${attempt} attempts: ${(result.result || '').substring(0, 200)}`);
       agentStatus[idx] = { ...agentStatus[idx], status: 'failed', chars: outputLen, cost: result.cost };
+    } else if (outputLen < MIN_OUTPUT_CHARS) {
+      logAndBroadcast(`  [Scan] ⚠️ ${agent.name} still short after ${attempt} attempts (${outputLen} chars)`);
+      agentStatus[idx] = { ...agentStatus[idx], status: 'done', chars: outputLen, cost: result.cost };
     } else {
       logAndBroadcast(`  [Scan] ✅ ${agent.name} done (${outputLen} chars, $${result.cost.toFixed(2)}${attempt > 1 ? `, ${attempt} attempts` : ''})`);
       agentStatus[idx] = { ...agentStatus[idx], status: 'done', chars: outputLen, cost: result.cost };
@@ -561,6 +776,124 @@ If no issues found: "✅ No ${agent.name} issues found."`;
   });
 
   const results = await Promise.all(agentPromises);
+
+  // ── Phase 1.5: Coverage Verification ──
+  // Check which files from the manifest appear in agent reports
+  // Coverage % only counts code files (not config like .json, .yaml)
+  const allReportText = results
+    .filter(r => r.result.success)
+    .map(r => r.result.result || '')
+    .join('\n');
+
+  const coveredFiles = new Set<string>();
+  const uncoveredFiles: string[] = [];
+
+  // Separate code files from config files for coverage calculation
+  const codeFiles: string[] = [];
+  const configFiles: string[] = [];
+  for (const file of allSourceFiles) {
+    const ext = path.extname(file).toLowerCase();
+    if (CONFIG_EXTENSIONS.has(ext)) {
+      configFiles.push(file);
+    } else {
+      codeFiles.push(file);
+    }
+  }
+
+  // Count duplicate basenames to avoid false-positive matching
+  const basenameCounts = new Map<string, number>();
+  for (const file of allSourceFiles) {
+    const bn = path.basename(file);
+    basenameCounts.set(bn, (basenameCounts.get(bn) || 0) + 1);
+  }
+
+  for (const file of allSourceFiles) {
+    // Primary: check if the full relative path appears in any report
+    if (allReportText.includes(file)) {
+      coveredFiles.add(file);
+      continue;
+    }
+    // Fallback: only use basename if it's unique in the repo (avoids false positives
+    // from common names like index.ts, types.ts, utils.ts)
+    const basename = path.basename(file);
+    if (basenameCounts.get(basename) === 1 && allReportText.includes(basename)) {
+      coveredFiles.add(file);
+    } else {
+      uncoveredFiles.push(file);
+    }
+  }
+
+  // Coverage % based on code files only (config files are bonus, not expected in reports)
+  const coveredCodeFiles = codeFiles.filter(f => coveredFiles.has(f));
+  const uncoveredCodeFiles = codeFiles.filter(f => !coveredFiles.has(f));
+  const coveragePercent = codeFiles.length > 0 ? Math.round((coveredCodeFiles.length / codeFiles.length) * 100) : 100;
+  logAndBroadcast(`  [Scan] 📊 Coverage Check: ${coveredCodeFiles.length}/${codeFiles.length} code files mentioned in reports (${coveragePercent}%) + ${configFiles.length} config files`);
+
+  if (uncoveredCodeFiles.length > 0) {
+    logAndBroadcast(`  [Scan] ⚠️ ${uncoveredCodeFiles.length} code files NOT mentioned in any agent report`);
+  }
+
+  // Save coverage report to audit dir
+  const coverageReport = `# Coverage Verification Report\n\nDate: ${new Date().toISOString()}\nTotal files: ${totalFiles} (${codeFiles.length} code + ${configFiles.length} config)\nCode files covered: ${coveredCodeFiles.length}/${codeFiles.length} (${coveragePercent}%)\nUncovered code files: ${uncoveredCodeFiles.length}\n\n## Uncovered Code Files\n${uncoveredCodeFiles.length > 0 ? uncoveredCodeFiles.map(f => `- ${f}`).join('\n') : '✅ All code files covered!'}\n\n## Config Files (not counted for coverage %)\n${configFiles.map(f => `- ${f} ${coveredFiles.has(f) ? '✅' : '—'}`).join('\n')}\n`;
+  fs.writeFileSync(path.join(auditDir, '00-coverage-verification.md'), coverageReport);
+
+  // ── Phase 1.6: Coverage Gap Agent (if significant gaps exist) ──
+  let gapAgentResult = '';
+  if (!aborted && uncoveredCodeFiles.length > 0 && coveragePercent < 90) {
+    const MAX_GAP_FILES = 100; // Cap to avoid oversized prompts
+    const gapFiles = uncoveredCodeFiles.slice(0, MAX_GAP_FILES);
+    logAndBroadcast(`  [Scan] 🔍 Running Coverage Gap Agent for ${gapFiles.length} uncovered code files...`);
+    broadcastScanProgress(scanId, { phase: 'coverage-gap', agents: agentStatus, totalCost });
+
+    const gapOutputFile = path.join(auditDir, '00-coverage-gaps.md');
+    const gapResult = await runClaudeAgentic(
+      `You are a Coverage Gap Agent for the code audit of "${repoFullName}".
+
+The main audit agents MISSED the following ${gapFiles.length} files. Your job is to review them for issues.
+
+Repository: ${repoFullName}
+Path: ${repoDir}
+Framework: ${frameworkInfo}
+
+⚠️ FILES TO REVIEW (these were missed by all other agents):
+${gapFiles.map(f => `- ${f}`).join('\n')}
+
+For each file:
+1. Read the file
+2. Check for: bugs, security issues, code quality problems, dead code, performance issues
+3. Report any findings with the standard format:
+   - **Severity**: 🔴 Critical / 🟡 Warning / 🔵 Info
+   - **Confidence**: 🔒 CONFIRMED / ⚠️ POTENTIAL / 🔍 NEEDS-VERIFICATION
+   - **File:Line**: Description
+   - **Fix Suggestion**: Concrete code
+
+If a file has no issues: "✅ ${'{file}'} — no issues found"
+
+Begin with: ## Coverage Gap Analysis
+End with a list of ALL files you reviewed.
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE report to this file: ${gapOutputFile}
+2. Do NOT write files to any other location.
+3. Your text response should be a brief summary only — the detailed report goes in the file.`,
+      repoDir,
+      AGENT_TIMEOUT,
+      model
+    );
+
+    totalCost += gapResult.cost;
+
+    // Prefer file output
+    gapAgentResult = gapResult.success ? gapResult.result : '';
+    if (fs.existsSync(gapOutputFile)) {
+      const fileContent = fs.readFileSync(gapOutputFile, 'utf8');
+      if (fileContent.length > gapAgentResult.length) {
+        gapAgentResult = fileContent;
+      }
+    }
+
+    logAndBroadcast(`  [Scan] ✅ Coverage Gap Agent done (${gapAgentResult.length} chars, $${gapResult.cost.toFixed(2)})`);
+  }
 
   // ── Phase 2: Aggregation (agentic mode with selected model for 1M context) ──
   logAndBroadcast(`  [Scan] Phase 2: Aggregation (${modelInfo.name}, agentic mode)...`);
@@ -579,9 +912,29 @@ If no issues found: "✅ No ${agent.name} issues found."`;
   getDb().prepare('UPDATE scans SET agent_results = ? WHERE id = ?')
     .run(JSON.stringify(agentResultsObj), scanId);
 
-  const agentResults = results.map(r =>
+  // Separate successful and failed agents
+  const successfulResults = results.filter(r => r.result.success && (r.result.result || '').length >= MIN_OUTPUT_CHARS);
+  const failedResults = results.filter(r => !r.result.success || (r.result.result || '').length < MIN_OUTPUT_CHARS);
+
+  if (failedResults.length > 0) {
+    logAndBroadcast(`  [Scan] ⚠️ ${failedResults.length} agents failed and will be excluded from aggregation: ${failedResults.map(r => r.agent.name).join(', ')}`);
+  }
+
+  const agentResults = successfulResults.map(r =>
     `### ${r.agent.name}\n${r.result.result}`
   ).join('\n\n---\n\n');
+
+  // Add failed agents note for aggregation
+  const failedNote = failedResults.length > 0
+    ? `\n\n---\n\n### ⚠️ Agents Not Analyzed (Failed)\nThe following agents failed after ${MAX_RETRIES} attempts and their areas were NOT analyzed:\n${failedResults.map(r => `- **${r.agent.name}** (${r.agent.focus})`).join('\n')}\n\nThese areas require manual review or a re-scan.`
+    : '';
+
+  // Add coverage info and gap agent results
+  const coverageNote = `\n\n---\n\n### 📊 Automated Coverage Verification\nFile manifest: ${totalFiles} source files\nFiles mentioned in reports: ${coveredFiles.size} (${coveragePercent}%)\nUncovered files: ${uncoveredFiles.length}${uncoveredFiles.length > 0 ? `\n\nUncovered:\n${uncoveredFiles.slice(0, 50).map(f => `- ${f}`).join('\n')}${uncoveredFiles.length > 50 ? `\n... and ${uncoveredFiles.length - 50} more` : ''}` : ''}`;
+
+  const gapNote = gapAgentResult
+    ? `\n\n---\n\n### 🔍 Coverage Gap Analysis (additional files reviewed)\n${gapAgentResult}`
+    : '';
 
   // Build the full report (all agents combined with headers)
   const fullReport = `# ${repoFullName} — Full Code Audit Report\nDate: ${new Date().toISOString().split('T')[0]}\nModel: ${modelInfo.name}\nFramework: ${frameworkInfo}\nModules: ${modules.map(m => `${m.name} (${m.lines} lines)`).join(', ')}\n\n` +
@@ -593,10 +946,11 @@ If no issues found: "✅ No ${agent.name} issues found."`;
     .run(fullReport, scanId);
 
   // Agentic aggregation with selected model (1M context support)
+  const aggOutputFile = path.join(auditDir, '12-summary-report.md');
   const aggResult = await runClaudeAgentic(
     `You are creating the final Code Audit Report for "${repoFullName}".
 
-Combine the following ${SCAN_AGENTS.length} agent reports into ONE structured report.
+Combine the following ${successfulResults.length} agent reports into ONE structured report (${failedResults.length > 0 ? `${failedResults.length} agents failed and are excluded` : 'all agents succeeded'}).
 
 Repository: ${repoFullName}
 Framework: ${frameworkInfo}
@@ -683,7 +1037,13 @@ Framework: ${frameworkInfo}
 
 AGENT RESULTS:
 
-${agentResults}`,
+${agentResults}${failedNote}${coverageNote}${gapNote}
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE aggregated report to this file: ${aggOutputFile}
+2. Do NOT write files to any other location.
+3. The file must contain your FULL report with all findings, not just a summary.
+4. Your text response should be a brief summary only — the detailed report goes in the file.`,
     repoDir,
     AGENT_TIMEOUT,
     model
@@ -691,39 +1051,31 @@ ${agentResults}`,
 
   totalCost += aggResult.cost;
   const duration = Math.round((Date.now() - startTime) / 1000);
-  const report = aggResult.success ? aggResult.result : agentResults;
 
-  // ── Save all reports to numbered audit folder ──
-  const repoSlug = repoFullName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-  const repoAuditsDir = path.join(getAuditsDir(), 'code-audits', repoSlug);
-  if (!fs.existsSync(repoAuditsDir)) fs.mkdirSync(repoAuditsDir, { recursive: true });
+  // Prefer file output for aggregation (can be very large)
+  let report = aggResult.success ? aggResult.result : agentResults;
+  if (fs.existsSync(aggOutputFile)) {
+    const fileContent = fs.readFileSync(aggOutputFile, 'utf8');
+    if (fileContent.length > report.length) {
+      logAndBroadcast(`  [Scan] 📄 Aggregation: using file output (${fileContent.length} chars) over result text (${report.length} chars)`);
+      report = fileContent;
+    }
+  }
 
-  // Determine next audit number
-  const existingAudits = fs.readdirSync(repoAuditsDir)
-    .filter(f => f.match(/^\d{2}-scan-/))
-    .sort();
-  const nextNum = existingAudits.length + 1;
-  const numStr = String(nextNum).padStart(2, '0');
-
-  const now = new Date();
-  const dateTimeStr = `${now.toISOString().split('T')[0]}_${now.toTimeString().slice(0, 8).replace(/:/g, '-')}`;
-  const auditFolderName = `${numStr}-scan-${dateTimeStr}`;
-  const auditDir = path.join(repoAuditsDir, auditFolderName);
-  fs.mkdirSync(auditDir, { recursive: true });
-
-  // Save architecture/framework detection
-  fs.writeFileSync(path.join(auditDir, '00-framework-detection.md'), architectureMap);
-
-  // Save individual agent results
+  // ── Save final reports to audit folder (already created before Phase 1) ──
+  // Agent files were either written by agents directly or we write them now
   for (const r of results) {
     const agentFile = path.join(auditDir, `${r.agent.id}.md`);
-    fs.writeFileSync(agentFile, `# ${r.agent.name}\n\n${r.result.result}`);
+    // Only overwrite if agent didn't write a file (or wrote a smaller one)
+    if (!fs.existsSync(agentFile) || fs.readFileSync(agentFile, 'utf8').length < (r.result.result || '').length) {
+      fs.writeFileSync(agentFile, `# ${r.agent.name}\n\n${r.result.result}`);
+    }
   }
 
   // Save full combined report (all agents)
   fs.writeFileSync(path.join(auditDir, '11-full-report.md'), fullReport);
 
-  // Save aggregated summary report
+  // Save aggregated summary report (may already exist from agent file-output)
   const reportFile = path.join(auditDir, '12-summary-report.md');
   fs.writeFileSync(reportFile, report);
 

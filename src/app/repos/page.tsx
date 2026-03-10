@@ -11,6 +11,11 @@ interface ModelOption {
   costPer1MOutput: number;
 }
 
+interface FrameworkOption {
+  key: string;
+  name: string;
+}
+
 export default function ReposPage() {
   const [repos, setRepos] = useState<Repo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -19,6 +24,8 @@ export default function ReposPage() {
   const [newName, setNewName] = useState('');
   const [adding, setAdding] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
+  const [frameworks, setFrameworks] = useState<FrameworkOption[]>([]);
+  const [selectedFramework, setSelectedFramework] = useState<string>('generic');
   const [scanMenuRepo, setScanMenuRepo] = useState<number | null>(null);
   const [pullingRepo, setPullingRepo] = useState<number | null>(null);
 
@@ -26,6 +33,7 @@ export default function ReposPage() {
   const [freshnessCheck, setFreshnessCheck] = useState<{
     repoId: number;
     model: string;
+    framework: string;
     behind: number;
     branch: string;
     localCommit: string;
@@ -44,6 +52,7 @@ export default function ReposPage() {
       const res = await fetch('/api/scan');
       const data = await res.json();
       setModels(data.models || []);
+      setFrameworks(data.frameworks || []);
     } catch { /* ignore */ }
   }
 
@@ -106,6 +115,7 @@ export default function ReposPage() {
         setFreshnessCheck({
           repoId,
           model,
+          framework: selectedFramework,
           behind: repo.behind,
           branch: repo.branch,
           localCommit: repo.localCommit,
@@ -115,20 +125,21 @@ export default function ReposPage() {
       }
     } catch { /* on error, proceed with scan */ }
     setCheckingFreshness(null);
-    startScan(repoId, model);
+    startScan(repoId, model, selectedFramework);
   }
 
-  async function startScan(repoId: number, model: string) {
+  async function startScan(repoId: number, model: string, framework: string) {
     setFreshnessCheck(null);
     setCheckingFreshness(null);
     const res = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ repoId, model }),
+      body: JSON.stringify({ repoId, model, framework }),
     });
     const data = await res.json();
+    const fwName = frameworks.find(f => f.key === framework)?.name || framework;
     if (res.ok) {
-      alert(`First Scan started with ${models.find(m => m.key === model)?.name || model}! Check Logs for progress.`);
+      alert(`First Scan started (${fwName}, ${models.find(m => m.key === model)?.name || model})! Check Logs for progress.`);
     } else {
       const details = data.details ? `\n\n${data.details.join('\n')}` : '';
       alert(`❌ ${data.error}${details}`);
@@ -137,7 +148,7 @@ export default function ReposPage() {
 
   async function updateAndScan() {
     if (!freshnessCheck) return;
-    const { repoId, model } = freshnessCheck;
+    const { repoId, model, framework } = freshnessCheck;
     setFreshnessCheck(null);
     setPullingRepo(repoId);
     try {
@@ -158,7 +169,7 @@ export default function ReposPage() {
       return;
     }
     setPullingRepo(null);
-    startScan(repoId, model);
+    startScan(repoId, model, framework);
   }
 
   if (loading) return <div className="text-[#666]">Loading repositories...</div>;
@@ -248,11 +259,31 @@ export default function ReposPage() {
                       {checkingFreshness === repo.id ? '⏳ Checking...' : '🔍 First Scan ▾'}
                     </button>
 
-                    {/* Model Selection Dropdown */}
+                    {/* Framework + Model Selection Dropdown */}
                     {scanMenuRepo === repo.id && (
-                      <div className="absolute right-0 top-full mt-1 bg-[#1a1a1a] border border-[#333] rounded-lg shadow-xl z-50 min-w-[280px]">
+                      <div className="absolute right-0 top-full mt-1 bg-[#1a1a1a] border border-[#333] rounded-lg shadow-xl z-50 min-w-[300px]">
+                        {/* Framework Selection */}
                         <div className="px-3 py-2 border-b border-[#333]">
-                          <p className="text-xs font-semibold text-[#888]">Select Model</p>
+                          <p className="text-xs font-semibold text-[#888] mb-2">Framework</p>
+                          <div className="flex gap-1.5 flex-wrap">
+                            {frameworks.map(fw => (
+                              <button
+                                key={fw.key}
+                                onClick={() => setSelectedFramework(fw.key)}
+                                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                                  selectedFramework === fw.key
+                                    ? 'bg-claude-600 text-white'
+                                    : 'bg-[#252525] text-[#888] hover:bg-[#333] hover:text-[#ccc]'
+                                }`}
+                              >
+                                {fw.name}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        {/* Model Selection */}
+                        <div className="px-3 py-2 border-b border-[#333]">
+                          <p className="text-xs font-semibold text-[#888]">Model</p>
                         </div>
                         {models.map(model => (
                           <button
@@ -304,8 +335,8 @@ export default function ReposPage() {
               </button>
               <button
                 onClick={() => {
-                  const { repoId, model } = freshnessCheck;
-                  startScan(repoId, model);
+                  const { repoId, model, framework } = freshnessCheck;
+                  startScan(repoId, model, framework);
                 }}
                 className="flex-1 bg-[#252525] hover:bg-[#333] text-[#ccc] px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-[#444]"
               >

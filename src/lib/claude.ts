@@ -122,6 +122,39 @@ export async function runClaude(
 // Agentic CLI (for Erst-Scans — thorough, multi-turn)
 // ──────────────────────────────────────────────
 
+// Concurrency limiter — prevents spawning too many Claude CLI processes at once.
+// On a 24GB M4 Mini, each Claude CLI process uses ~500MB-1GB RAM.
+// Max 5 concurrent keeps memory usage under control and avoids API rate issues.
+const MAX_CONCURRENT_AGENTS = 5;
+let _runningAgents = 0;
+const _waitQueue: Array<() => void> = [];
+
+function acquireSlot(): Promise<void> {
+  if (_runningAgents < MAX_CONCURRENT_AGENTS) {
+    _runningAgents++;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    _waitQueue.push(() => {
+      _runningAgents++;
+      resolve();
+    });
+  });
+}
+
+function releaseSlot(): void {
+  _runningAgents--;
+  if (_waitQueue.length > 0) {
+    const next = _waitQueue.shift()!;
+    next();
+  }
+}
+
+/** Current number of running / queued agents (for diagnostics) */
+export function getAgentConcurrency(): { running: number; queued: number } {
+  return { running: _runningAgents, queued: _waitQueue.length };
+}
+
 interface ClaudeCliJsonResponse {
   type: string;
   subtype: string;
@@ -150,18 +183,26 @@ export type ModelKey = keyof typeof AVAILABLE_MODELS;
  * Used for Erst-Scans where Claude needs to explore the full codebase.
  * More expensive but much more thorough for large repos.
  */
-export function runClaudeAgentic(
+export async function runClaudeAgentic(
   prompt: string,
   repoDir: string,
   timeoutMs = 600000,
   model: ModelKey = 'sonnet'
 ): Promise<ClaudeResult> {
+  // Wait for a concurrency slot before spawning the CLI process
+  await acquireSlot();
+
   return new Promise((resolve) => {
     const startTime = Date.now();
     const tempFile = path.join(LOGS_DIR, `temp-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
 
     if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
     fs.writeFileSync(tempFile, prompt);
+
+    const done = (result: ClaudeResult) => {
+      releaseSlot();
+      resolve(result);
+    };
 
     const modelFlag = model !== 'sonnet' ? ` --model ${AVAILABLE_MODELS[model].id}` : '';
     const child = exec(
@@ -190,7 +231,7 @@ export function runClaudeAgentic(
         if (error) {
           const estimatedTokens = Math.ceil(prompt.length / 4);
           const errDetail = stderr?.trim() ? `${error.message} | stderr: ${stderr.trim().substring(0, 300)}` : error.message;
-          resolve({
+          done({
             success: false,
             result: `Error: ${errDetail}`,
             durationMs,
@@ -210,7 +251,7 @@ export function runClaudeAgentic(
           // total_cost_usd includes ALL turns (tool use, reasoning, etc.)
           const cost = json.total_cost_usd || json.cost_usd || calculateCost(inputTokens, outputTokens);
 
-          resolve({
+          done({
             success: !json.is_error,
             result: json.result || '',
             durationMs,
@@ -223,7 +264,7 @@ export function runClaudeAgentic(
           // JSON parse failed — fallback
           const estimatedInput = Math.ceil(prompt.length / 4);
           const estimatedOutput = Math.ceil((stdout?.length || 0) / 4);
-          resolve({
+          done({
             success: true,
             result: stdout.trim(),
             durationMs,
