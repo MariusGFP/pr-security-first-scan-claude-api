@@ -636,6 +636,23 @@ OUTPUT INSTRUCTIONS (MANDATORY):
         }
       }
 
+      // Second pass: recover files written by killed sub-agents (race condition safety)
+      // When a Claude CLI process is SIGKILL'd, its file write may complete moments after
+      // the error callback fires, causing fs.existsSync to miss the file in the first pass.
+      for (let i = 0; i < subResults.length; i++) {
+        if (subOutputs[i].includes('❌ Sub-agent failed')) {
+          const subFile = subPromises[i].outputFile;
+          if (fs.existsSync(subFile)) {
+            const fileContent = fs.readFileSync(subFile, 'utf8');
+            if (fileContent.length >= MIN_OUTPUT_CHARS) {
+              logAndBroadcast(`    [${agent.id}] 📄 Sub-agent ${modules[i].name}: late file recovery (${fileContent.length} chars)`);
+              subOutputs[i] = fileContent;
+              successfulSubCount++;
+            }
+          }
+        }
+      }
+
       // Check safety limits after sub-agents
       if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
         logAndBroadcast(`  [Scan] 🛑 TIME LIMIT reached (${Math.round((Date.now() - startTime) / 60000)}min). Remaining agents will be skipped.`);
@@ -1042,8 +1059,9 @@ ${agentResults}${failedNote}${coverageNote}${gapNote}
 OUTPUT INSTRUCTIONS (MANDATORY):
 1. Write your COMPLETE aggregated report to this file: ${aggOutputFile}
 2. Do NOT write files to any other location.
-3. The file must contain your FULL report with all findings, not just a summary.
-4. Your text response should be a brief summary only — the detailed report goes in the file.`,
+3. This is the PRIORITIZED SUMMARY — deduplicate, merge similar findings, and cap at 80 total findings.
+4. The full unfiltered agent reports are saved separately. This report should be the executive-readable version.
+5. Your text response should be a brief summary only — the detailed report goes in the file.`,
     repoDir,
     AGENT_TIMEOUT,
     model
@@ -1102,31 +1120,76 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 /**
  * Extract a short framework summary from the architecture map output.
  * e.g., "Laravel 12 / PHP 8.4 / MySQL"
+ *
+ * Handles multiple output formats:
+ * - Table: | **Framework** | Laravel 12 |
+ * - List:  - **Framework**: Laravel 12
+ * - Bold:  **Framework**: Laravel 12
  */
 function extractFrameworkSummary(architectureMap: string): string {
-  // Try to extract from structured output
   const lines = architectureMap.split('\n');
   let framework = '';
   let language = '';
   let db = '';
 
+  /**
+   * Extract value from a line containing a bold key.
+   * Handles: `| **Key** | Value |`, `- **Key**: Value`, `**Key**: Value`
+   */
+  function extractValue(line: string): string {
+    // Table format: | **Key** | Value | — extract cell after the key cell
+    if (line.includes('|')) {
+      const cells = line.split('|').map(c => c.trim()).filter(Boolean);
+      // Return the cell AFTER the one containing **
+      for (let i = 0; i < cells.length - 1; i++) {
+        if (cells[i].includes('**')) {
+          // Check if value is in the same cell (e.g., | **Key**: Value |)
+          const keyCell = cells[i];
+          if (keyCell.includes(':')) {
+            const afterColon = keyCell.split(':').slice(1).join(':');
+            const val = afterColon.replace(/\*\*/g, '').replace(/`/g, '').trim();
+            if (val) return val;
+          }
+          // Otherwise, value is in the next cell
+          return cells[i + 1].replace(/\*\*/g, '').replace(/`/g, '').trim();
+        }
+      }
+    }
+    // List/bold format: remove everything up to and including the key
+    return line
+      .replace(/^[\s\-*|]*\*\*[^*]+\*\*[:\s|]*/i, '')
+      .replace(/\*\*/g, '')
+      .replace(/`/g, '')
+      .replace(/\|/g, '')
+      .trim();
+  }
+
   for (const line of lines) {
     const l = line.toLowerCase();
-    if (l.includes('**framework**') || l.includes('* **framework**')) {
-      framework = line.replace(/[^:]*\*\*[Ff]ramework\*\*[:\s]*/i, '').replace(/\*\*/g, '').trim();
+    // Match **Framework** but NOT **Framework-specific** or similar compounds
+    if (!framework && (l.includes('**framework**') || l.match(/\*\*framework\s*\*\*/))) {
+      if (!l.includes('framework-') && !l.includes('framework specific')) {
+        framework = extractValue(line);
+      }
     }
-    if (l.includes('**language**') || l.includes('* **language**')) {
-      language = line.replace(/[^:]*\*\*[Ll]anguage\*\*[:\s]*/i, '').replace(/\*\*/g, '').trim();
+    // Match **PHP**, **Language**, **Python**, **Node**, etc.
+    if (!language && (l.includes('**language**') || l.includes('**php**') || l.includes('**python**') || l.includes('**node**'))) {
+      language = extractValue(line);
     }
-    if (l.includes('**database**') || l.includes('* **database**')) {
-      db = line.replace(/[^:]*\*\*[Dd]atabase\*\*[:\s]*/i, '').replace(/\*\*/g, '').trim();
+    // Match **Database** but not **Database (dev)** — prefer (prod) or plain
+    if (l.includes('**database**') || l.match(/\*\*database\s*\(prod\)\*\*/)) {
+      if (!l.includes('(dev)') && !l.includes('(test)')) {
+        db = extractValue(line);
+      }
     }
   }
 
-  const parts = [framework, language, db].filter(Boolean);
+  // Clean up extracted values — remove parenthetical version constraints like (^12.0)
+  const clean = (s: string) => s.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  const parts = [framework, language, db].map(clean).filter(Boolean);
   if (parts.length > 0) return parts.join(' / ');
 
-  // Fallback: scan for common framework names
+  // Fallback: scan for common framework names with version numbers
   const text = architectureMap.substring(0, 5000);
   const frameworks = [
     'Laravel', 'Next\\.js', 'Nuxt', 'Django', 'Rails', 'Spring Boot', 'Express',
