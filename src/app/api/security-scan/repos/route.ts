@@ -109,9 +109,6 @@ export async function POST(req: NextRequest) {
     if (!fs.existsSync(resolvedPath)) {
       return NextResponse.json({ error: `Directory not found: ${localPath}` }, { status: 404 });
     }
-    if (!fs.existsSync(path.join(resolvedPath, '.git'))) {
-      return NextResponse.json({ error: `Not a Git repo: ${localPath}` }, { status: 400 });
-    }
 
     repoName = path.basename(resolvedPath);
 

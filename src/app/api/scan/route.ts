@@ -45,7 +45,7 @@ function resolveRepoDir(repo: { id: number; name: string; org: string; local_pat
     path.join(reposDir, 'github', repo.name),
   ];
   for (const candidate of candidates) {
-    if (fs.existsSync(candidate) && fs.existsSync(path.join(candidate, '.git'))) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
       updateRepo(repo.id, { local_path: candidate } as any);
       logAndBroadcast(`  [Scan] Updated repo path: ${candidate}`);
       return candidate;
@@ -118,11 +118,9 @@ function runPreFlightChecks(repoDir: string, framework: string): string[] {
     }
   }
 
-  // 4. Check repo exists and is a git repo
+  // 4. Check repo directory exists (git is optional — plain folders are supported for scans)
   if (!fs.existsSync(repoDir)) {
     errors.push(`Repo-Verzeichnis nicht gefunden: ${repoDir}`);
-  } else if (!fs.existsSync(path.join(repoDir, '.git'))) {
-    errors.push(`Kein Git-Repository: ${repoDir}`);
   }
 
   // 5. Check ANTHROPIC_API_KEY is set
@@ -1176,8 +1174,8 @@ function extractFrameworkSummary(architectureMap: string): string {
     if (!language && (l.includes('**language**') || l.includes('**php**') || l.includes('**python**') || l.includes('**node**'))) {
       language = extractValue(line);
     }
-    // Match **Database** but not **Database (dev)** — prefer (prod) or plain
-    if (l.includes('**database**') || l.match(/\*\*database\s*\(prod\)\*\*/)) {
+    // Match **Database** but not **Database (dev)** — prefer (prod) or plain, first match wins
+    if (!db && (l.includes('**database**') || l.match(/\*\*database\s*\(prod\)\*\*/))) {
       if (!l.includes('(dev)') && !l.includes('(test)')) {
         db = extractValue(line);
       }

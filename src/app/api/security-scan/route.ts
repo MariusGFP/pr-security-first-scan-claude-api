@@ -61,12 +61,10 @@ function runPreFlightChecks(repoFullPaths: string[]): string[] {
     }
   }
 
-  // 4. Check repos exist and are git repos
+  // 4. Check repo directories exist (git is optional — plain folders are supported for scans)
   for (const rp of repoFullPaths) {
     if (!fs.existsSync(rp)) {
       errors.push(`Repo-Verzeichnis nicht gefunden: ${rp}`);
-    } else if (!fs.existsSync(path.join(rp, '.git'))) {
-      errors.push(`Kein Git-Repository: ${rp}`);
     }
   }
 
