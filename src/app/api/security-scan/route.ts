@@ -8,23 +8,25 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-const PROMPTS_DIR = path.join(process.cwd(), 'prompts', 'security-scan');
+const PROMPTS_BASE_DIR = path.join(process.cwd(), 'prompts', 'security-scan');
 
 /**
  * Pre-flight checks before starting a security scan.
  * Returns an array of error messages. Empty = all checks passed.
  */
-function runPreFlightChecks(repoFullPaths: string[]): string[] {
+function runPreFlightChecks(repoFullPaths: string[], preset: string): string[] {
   const errors: string[] = [];
 
-  // 1. Check prompt files exist
-  const archPrompt = path.join(PROMPTS_DIR, '00-architecture-mapping.md');
+  // 1. Check prompt files exist for selected preset
+  const promptsDir = getPromptsDir(preset);
+  const agents = getAgentsForPreset(preset);
+  const archPrompt = path.join(promptsDir, '00-architecture-mapping.md');
   if (!fs.existsSync(archPrompt)) {
-    errors.push(`Prompt-Dateien nicht gefunden: ${PROMPTS_DIR} existiert nicht. PROMPTS_DIR zeigt auf: ${PROMPTS_DIR}`);
+    errors.push(`Prompt-Dateien nicht gefunden: ${promptsDir} existiert nicht`);
   } else {
-    const missingPrompts = SECURITY_AGENTS
+    const missingPrompts = agents
       .map(a => a.id)
-      .filter(id => !fs.existsSync(path.join(PROMPTS_DIR, `${id}.md`)));
+      .filter(id => !fs.existsSync(path.join(promptsDir, `${id}.md`)));
     if (missingPrompts.length > 0) {
       errors.push(`Fehlende Agent-Prompts: ${missingPrompts.join(', ')}`);
     }
@@ -82,17 +84,59 @@ function getAuditsDir(): string {
   return fromKeys || path.join(process.env.HOME || '~', 'automation', 'audits');
 }
 
-// Security scan agent definitions
-const SECURITY_AGENTS = [
-  { id: '01-auth-identity',          name: 'Auth & Identity Flow',    focus: 'JWT/Token security, RBAC, cross-service auth, session management, IDOR' },
-  { id: '02-api-security',           name: 'API Security',            focus: 'Input validation, rate limiting, CORS, response filtering, SSRF, mass assignment' },
-  { id: '03-crypto-web3',            name: 'Crypto/Web3 Security',    focus: 'Fireblocks integration, transaction safety, smart contracts, RPC security, DeFi risks' },
-  { id: '04-secrets-credentials',    name: 'Secrets & Credentials',   focus: 'Hardcoded secrets, env config, git history, credential exposure, secret rotation' },
-  { id: '05-cross-repo-attack-surface', name: 'Cross-Repo Attack Surface', focus: 'Trust boundaries, lateral movement, service-to-service auth, shared resources' },
-  { id: '06-injection-owasp',        name: 'Injection & OWASP',       focus: 'SQL/NoSQL/Command injection, XSS, SSRF, broken access control, full OWASP Top 10' },
-  { id: '07-scheduler-job-safety',   name: 'Scheduler & Job Safety',  focus: 'Idempotency, race conditions, double execution, concurrency control in trading ops' },
-  { id: '08-dependency-supply-chain', name: 'Dependency & Supply Chain', focus: 'CVEs, typosquatting, outdated packages, crypto library versions, license audit' },
+// ── Per-preset agent definitions ──
+const SHARED_AGENTS = [
+  { id: '01-auth-identity',             name: 'Auth & Identity Flow',      focus: 'JWT/Token security, RBAC, cross-service auth, session management, IDOR' },
+  { id: '02-api-security',              name: 'API Security',              focus: 'Input validation, rate limiting, CORS, response filtering, SSRF, mass assignment' },
 ];
+const SHARED_AGENTS_TAIL = [
+  { id: '04-secrets-credentials',       name: 'Secrets & Credentials',     focus: 'Hardcoded secrets, env config, git history, credential exposure, secret rotation' },
+  { id: '05-cross-repo-attack-surface', name: 'Cross-Repo Attack Surface', focus: 'Trust boundaries, lateral movement, service-to-service auth, shared resources' },
+  { id: '06-injection-owasp',           name: 'Injection & OWASP',         focus: 'SQL/NoSQL/Command injection, XSS, SSRF, broken access control, full OWASP Top 10' },
+  { id: '07-scheduler-job-safety',      name: 'Scheduler & Job Safety',    focus: 'Idempotency, race conditions, double execution, concurrency control' },
+  { id: '08-dependency-supply-chain',   name: 'Dependency & Supply Chain', focus: 'CVEs, typosquatting, outdated packages, license audit' },
+];
+
+const CRYPTO_AGENTS = [
+  ...SHARED_AGENTS,
+  { id: '03-crypto-web3',               name: 'Crypto/Web3 Security',      focus: 'Fireblocks integration, transaction safety, smart contracts, RPC security, DeFi risks' },
+  ...SHARED_AGENTS_TAIL,
+];
+
+const SAAS_AGENTS = [
+  ...SHARED_AGENTS,
+  { id: '03-payment-webhook',           name: 'Payment & Webhook Security', focus: 'Payment gateway integrations, webhook signature validation, double-charge prevention, refund security' },
+  ...SHARED_AGENTS_TAIL,
+  { id: '09-multi-tenant-isolation',    name: 'Multi-Tenant Isolation',     focus: 'Tenant boundary enforcement, cross-tenant data leakage, cache/queue/storage isolation' },
+  { id: '10-pii-data-privacy',          name: 'PII & Data Privacy',         focus: 'GDPR/nDSG compliance, PII in logs, data minimization, children data protection, right to deletion' },
+  { id: '11-file-upload-storage',       name: 'File Upload & Storage',      focus: 'Upload validation, cloud storage security, SAS/pre-signed URLs, document processing, path traversal' },
+];
+
+const GENERIC_AGENTS = [
+  ...SHARED_AGENTS,
+  ...SHARED_AGENTS_TAIL,
+];
+
+// ── Security Scan Presets ──
+type AgentDef = { id: string; name: string; focus: string };
+const SECURITY_PRESETS: Record<string, { name: string; promptDir: string; agents: AgentDef[] }> = {
+  'crypto': { name: 'Crypto / DeFi / Trading', promptDir: 'crypto', agents: CRYPTO_AGENTS },
+  'saas':   { name: 'SaaS (Payments, Multi-Tenant, PII)', promptDir: 'saas', agents: SAAS_AGENTS },
+  'generic': { name: 'Generic (keine Payments/Crypto)', promptDir: 'generic', agents: GENERIC_AGENTS },
+};
+
+function getPromptsDir(preset: string): string {
+  const p = SECURITY_PRESETS[preset];
+  if (p) {
+    const dir = path.join(PROMPTS_BASE_DIR, p.promptDir);
+    if (fs.existsSync(dir)) return dir;
+  }
+  return path.join(PROMPTS_BASE_DIR, 'generic');
+}
+
+function getAgentsForPreset(preset: string): AgentDef[] {
+  return SECURITY_PRESETS[preset]?.agents || GENERIC_AGENTS;
+}
 
 // Ensure security_scans table exists
 function ensureTable() {
@@ -130,13 +174,19 @@ function ensureTable() {
 export async function GET() {
   ensureTable();
   const scans = getDb().prepare('SELECT * FROM security_scans ORDER BY created_at DESC').all();
-  return NextResponse.json({ scans, models: Object.entries(AVAILABLE_MODELS).map(([key, val]) => ({ key, ...val })) });
+  const presets = Object.entries(SECURITY_PRESETS).map(([key, val]) => ({
+    key,
+    name: val.name,
+    agentCount: val.agents.length,
+  }));
+  return NextResponse.json({ scans, models: Object.entries(AVAILABLE_MODELS).map(([key, val]) => ({ key, ...val })), presets });
 }
 
 export async function POST(req: NextRequest) {
   ensureTable();
-  const { platformName, reposDir, repoPaths, model } = await req.json();
+  const { platformName, reposDir, repoPaths, model, preset } = await req.json();
   const selectedModel: ModelKey = (model && model in AVAILABLE_MODELS) ? model : 'opus';
+  const selectedPreset: string = (preset && preset in SECURITY_PRESETS) ? preset : 'generic';
 
   let resolvedDir: string;
   let repos: string[];
@@ -176,7 +226,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Pre-flight checks
-  const preFlightErrors = runPreFlightChecks(repoFullPaths);
+  const preFlightErrors = runPreFlightChecks(repoFullPaths, selectedPreset);
   if (preFlightErrors.length > 0) {
     return NextResponse.json({
       error: 'Pre-Flight-Check fehlgeschlagen',
@@ -185,17 +235,19 @@ export async function POST(req: NextRequest) {
   }
 
   const modelInfo = AVAILABLE_MODELS[selectedModel];
+  const agents = getAgentsForPreset(selectedPreset);
+  const presetName = SECURITY_PRESETS[selectedPreset]?.name || 'Generic';
   const displayDir = repoPaths ? `[${repos.length} Repos]` : reposDir;
   const result = getDb().prepare(
     `INSERT INTO security_scans (platform_name, repos_dir, status, model, total_agents) VALUES (?, ?, 'running', ?, ?)`
-  ).run(platformName, displayDir, selectedModel, SECURITY_AGENTS.length);
+  ).run(platformName, displayDir, selectedModel, agents.length);
   const scanId = result.lastInsertRowid as number;
 
-  logAndBroadcast(`🔒 Security Scan started for "${platformName}" (${repos.length} Repos, ${modelInfo.name}, ${SECURITY_AGENTS.length} Agents)`);
+  logAndBroadcast(`🔒 Security Scan started for "${platformName}" (${repos.length} Repos, ${modelInfo.name}, ${presetName}, ${agents.length} Agents)`);
   logAndBroadcast(`   Repos: ${repos.join(', ')}`);
 
   // Run async — pass full paths for explicit repos
-  runSecurityScan(scanId, platformName, resolvedDir, repos, selectedModel, repoFullPaths).catch(e => {
+  runSecurityScan(scanId, platformName, resolvedDir, repos, selectedModel, repoFullPaths, selectedPreset).catch(e => {
     const errMsg = e instanceof Error ? e.message : String(e);
     const errStack = e instanceof Error ? e.stack : '';
     logAndBroadcast(`❌ Security Scan failed: ${errMsg}`);
@@ -211,8 +263,11 @@ const MAX_SCAN_DURATION_MS = 45 * 60 * 1000; // 45 minutes max for entire scan
 const AGENT_TIMEOUT_MS = 600000;   // 10 min per individual agent (down from 15)
 
 async function runSecurityScan(
-  scanId: number, platformName: string, reposDir: string, repos: string[], model: ModelKey, repoFullPaths?: string[]
+  scanId: number, platformName: string, reposDir: string, repos: string[], model: ModelKey, repoFullPaths?: string[], preset: string = 'generic'
 ) {
+  const SCAN_AGENTS = getAgentsForPreset(preset);
+  const promptsDir = getPromptsDir(preset);
+  const presetName = SECURITY_PRESETS[preset]?.name || 'Generic';
   const startTime = Date.now();
   let totalCost = 0;
   let aborted = false;
@@ -226,13 +281,13 @@ async function runSecurityScan(
 
   // Build initial agent status list
   const agentStatus: Array<{ id: string; name: string; status: string; chars?: number; cost?: number; attempt?: number }> =
-    SECURITY_AGENTS.map(a => ({ id: a.id, name: a.name, status: 'pending' }));
+    SCAN_AGENTS.map(a => ({ id: a.id, name: a.name, status: 'pending' }));
 
   // ── Phase 0: Architecture Mapping ──
   logAndBroadcast(`  [Security] Phase 0: Architecture Mapping (${modelInfo.name})...`);
   broadcastScanProgress(scanId, { phase: 'mapping', agents: agentStatus });
 
-  const mappingPromptFile = path.join(PROMPTS_DIR, '00-architecture-mapping.md');
+  const mappingPromptFile = path.join(promptsDir, '00-architecture-mapping.md');
   let mappingPrompt = fs.existsSync(mappingPromptFile) ? fs.readFileSync(mappingPromptFile, 'utf8') : '';
   mappingPrompt = mappingPrompt
     .replace(/\{\{PLATFORM_NAME\}\}/g, platformName)
@@ -290,7 +345,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   logAndBroadcast(`  [Security] 📁 Audit folder: ${auditDir}`);
 
   // ── Phase 1: 8 Security Agents parallel ──
-  logAndBroadcast(`  [Security] Phase 1: ${SECURITY_AGENTS.length} Security Agents parallel (${modelInfo.name})...`);
+  logAndBroadcast(`  [Security] Phase 1: ${SCAN_AGENTS.length} Security Agents parallel (${modelInfo.name}, ${presetName})...`);
   agentStatus.forEach(a => a.status = 'running' as any);
   broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus });
 
@@ -298,8 +353,8 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   const MIN_OUTPUT_CHARS = 500;
   const RETRY_DELAY_MS = 30000; // 30s delay between retries
 
-  const agentPromises = SECURITY_AGENTS.map(async (agent, idx) => {
-    const promptFile = path.join(PROMPTS_DIR, `${agent.id}.md`);
+  const agentPromises = SCAN_AGENTS.map(async (agent, idx) => {
+    const promptFile = path.join(promptsDir, `${agent.id}.md`);
     let basePrompt = fs.existsSync(promptFile) ? fs.readFileSync(promptFile, 'utf8') : '';
     basePrompt = basePrompt
       .replace(/\{\{PLATFORM_NAME\}\}/g, platformName)
@@ -357,7 +412,9 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     if (fs.existsSync(outputFile)) {
       const fileContent = fs.readFileSync(outputFile, 'utf8');
       if (fileContent.length > (result.result || '').length) {
-        logAndBroadcast(`  [Security] 📄 ${agent.name}: using file output (${fileContent.length} chars) over result text (${(result.result || '').length} chars)`);
+        if (!result.success) {
+          logAndBroadcast(`  [Security] 📄 ${agent.name}: recovered from failure via file output (${fileContent.length} chars)`);
+        }
         result = { ...result, result: fileContent, success: true };
       }
     }
@@ -378,6 +435,22 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   });
 
   const results = await Promise.all(agentPromises);
+
+  // Second pass: recover files written by killed sub-agents (race condition safety)
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (!r.result.success || (r.result.result || '').length < MIN_OUTPUT_CHARS) {
+      const outputFile = path.join(auditDir, `${r.agent.id}.md`);
+      if (fs.existsSync(outputFile)) {
+        const fileContent = fs.readFileSync(outputFile, 'utf8');
+        if (fileContent.length >= MIN_OUTPUT_CHARS) {
+          logAndBroadcast(`  [Security] 📄 ${r.agent.name}: late file recovery (${fileContent.length} chars)`);
+          results[i] = { ...r, result: { ...r.result, result: fileContent, success: true } };
+          agentStatus[i] = { ...agentStatus[i], status: 'done', chars: fileContent.length };
+        }
+      }
+    }
+  }
 
   // ── Phase 2: Aggregation (grouped by repo) ──
   logAndBroadcast(`  [Security] Phase 2: Aggregation (by repo)...`);
@@ -416,7 +489,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   // Build the full report (all agents combined with headers)
   const fullReport = `# ${platformName} — Full Security Audit Report\nDate: ${new Date().toISOString().split('T')[0]}\nModel: ${modelInfo.name}\nRepos: ${repos.join(', ')}\n\n` +
     results.map(r =>
-      `${'='.repeat(80)}\n## ${r.agent.id}: ${r.agent.name}\nFocus: ${SECURITY_AGENTS.find(a => a.id === r.agent.id)?.focus || ''}\nStatus: ${r.result.success ? 'OK' : 'FAILED'} | ${(r.result.result || '').length} chars | $${r.result.cost.toFixed(2)}\n${'='.repeat(80)}\n\n${r.result.result}`
+      `${'='.repeat(80)}\n## ${r.agent.id}: ${r.agent.name}\nFocus: ${SCAN_AGENTS.find(a => a.id === r.agent.id)?.focus || ''}\nStatus: ${r.result.success ? 'OK' : 'FAILED'} | ${(r.result.result || '').length} chars | $${r.result.cost.toFixed(2)}\n${'='.repeat(80)}\n\n${r.result.result}`
     ).join('\n\n\n');
 
   // Save full report to DB
@@ -456,6 +529,15 @@ CONFIDENCE HANDLING:
 - 🔍 NEEDS-VERIFICATION = theoretical, depends on deployment/runtime
 - When in doubt between CONFIRMED and POTENTIAL, keep POTENTIAL
 - The "Infrastructure Verification Checklist" helps the team quickly verify all POTENTIAL/NEEDS-VERIFICATION items
+
+🔴 CRITICAL FINDING CROSS-VALIDATION (MANDATORY):
+For EVERY 🔴 Critical finding, you MUST verify before including it in the report:
+1. **Exploit Path present?** — Does the agent provide a concrete path: input → vulnerable code → impact with file:line references? If no exploit path → downgrade to 🟡 Warning.
+2. **Compensation check done?** — Did the agent check for middleware, framework defaults, base classes, or gateway-level protections? If no compensation check → downgrade to ⚠️ POTENTIAL.
+3. **Cross-agent consistency** — If Agent A flags a Critical in code area X, but Agent B also analyzed area X and found no issue → downgrade to ⚠️ POTENTIAL (conflicting evidence).
+4. **Framework default awareness** — If the finding is about something the framework handles by default (React XSS, ORM SQL injection, Rails CSRF) and the agent didn't prove a bypass → downgrade to 🟡 Warning.
+5. **Test/dev only** — If the finding is only in test files, seed scripts, or dev code → downgrade to 🔵 Info.
+Only Criticals that survive all 5 checks remain 🔴 Critical in the final report.
 
 FORMAT:
 # ${platformName} — Security Audit Report
@@ -506,14 +588,7 @@ This audit uses a three-tier confidence system. POTENTIAL and NEEDS-VERIFICATION
 
 | Agent | Repos Covered | Files Reviewed | Coverage % | Has Coverage Report? |
 |-------|--------------|----------------|------------|---------------------|
-| 01 Auth & Identity | ... | ... | ...% | ✅ / ⚠️ Missing |
-| 02 API Security | ... | ... | ...% | ✅ / ⚠️ Missing |
-| 03 Crypto/Web3 | ... | ... | ...% | ✅ / ⚠️ Missing |
-| 04 Secrets & Credentials | ... | ... | ...% | ✅ / ⚠️ Missing |
-| 05 Cross-Repo Attack Surface | ... | ... | ...% | ✅ / ⚠️ Missing |
-| 06 Injection & OWASP | ... | ... | ...% | ✅ / ⚠️ Missing |
-| 07 Scheduler & Job Safety | ... | ... | ...% | ✅ / ⚠️ Missing |
-| 08 Dependency & Supply Chain | ... | ... | ...% | ✅ / ⚠️ Missing |
+${SCAN_AGENTS.map(a => `| ${a.id} ${a.name} | ... | ... | ...% | ✅ / ⚠️ Missing |`).join('\n')}
 
 ### File Coverage Detail
 For EACH repo, list ALL files that were reviewed by at least one agent:
@@ -535,7 +610,7 @@ ${agentResults}${failedNote}
 OUTPUT INSTRUCTIONS (MANDATORY):
 1. Write your COMPLETE aggregated report to this file: ${aggOutputFile}
 2. Do NOT write files to any other location.
-3. The file must contain your FULL report with all findings, not just a summary.
+3. The file must contain your PRIORITIZED SUMMARY — deduplicate, merge similar findings, and cap at 100 total findings.
 4. Your text response should be a brief summary only — the detailed report goes in the file.`,
     workingDir,
     600000,
@@ -550,7 +625,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   if (fs.existsSync(aggOutputFile)) {
     const fileContent = fs.readFileSync(aggOutputFile, 'utf8');
     if (fileContent.length > report.length) {
-      logAndBroadcast(`  [Security] 📄 Aggregation: using file output (${fileContent.length} chars) over result text (${report.length} chars)`);
+      logAndBroadcast(`  [Security] ✅ Aggregation done (${fileContent.length} chars, $${aggResult.cost.toFixed(2)})`);
       report = fileContent;
     }
   }

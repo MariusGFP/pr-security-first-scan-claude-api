@@ -39,9 +39,16 @@ interface ModelOption {
   costPer1MOutput: number;
 }
 
+interface PresetOption {
+  key: string;
+  name: string;
+  agentCount: number;
+}
+
 export default function SecurityPage() {
   const [scans, setScans] = useState<SecurityScan[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
+  const [presets, setPresets] = useState<PresetOption[]>([]);
   const [repos, setRepos] = useState<SecurityRepo[]>([]);
   const [platforms, setPlatforms] = useState<Record<string, SecurityRepo[]>>({});
   const [loading, setLoading] = useState(true);
@@ -50,6 +57,7 @@ export default function SecurityPage() {
   // Form state
   const [platformName, setPlatformName] = useState('');
   const [selectedModel, setSelectedModel] = useState('opus');
+  const [selectedPreset, setSelectedPreset] = useState('generic');
   const [selectedRepoIds, setSelectedRepoIds] = useState<Set<number>>(new Set());
 
   // Add repo form
@@ -156,6 +164,7 @@ export default function SecurityPage() {
       const repoData = await repoRes.json();
       setScans(scanData.scans || []);
       setModels(scanData.models || []);
+      setPresets(scanData.presets || []);
       setRepos(repoData.repos || []);
       setPlatforms(repoData.platforms || {});
 
@@ -328,7 +337,7 @@ export default function SecurityPage() {
       const res = await fetch('/api/security-scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platformName, repoPaths, model: selectedModel }),
+        body: JSON.stringify({ platformName, repoPaths, model: selectedModel, preset: selectedPreset }),
       });
       const data = await res.json();
       if (res.ok) {
@@ -805,6 +814,20 @@ export default function SecurityPage() {
           <h3 className="text-sm font-semibold mb-4">Start Scan</h3>
           <div className="flex items-center gap-4">
             <div className="flex-1">
+              <label className="text-xs text-[#888] block mb-1">Preset</label>
+              <select
+                value={selectedPreset}
+                onChange={e => setSelectedPreset(e.target.value)}
+                className="w-full bg-[#1a1a1a] border border-[#333] rounded-lg px-3 py-2 text-sm text-white focus:border-claude-500 focus:outline-none"
+              >
+                {presets.map(p => (
+                  <option key={p.key} value={p.key}>
+                    {p.name} ({p.agentCount} Agents)
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex-1">
               <label className="text-xs text-[#888] block mb-1">Modell</label>
               <select
                 value={selectedModel}
@@ -827,7 +850,7 @@ export default function SecurityPage() {
                 {checkingFreshness ? '⏳ Checking repos...' : starting ? '⏳ Starting...' : `🔒 Start Scan (${selectedRepoIds.size} Repos)`}
               </button>
               <p className="text-xs text-[#555] mt-1">
-                Phase 0: Architecture → Phase 1: 8 Agents → Phase 2: Report
+                {(() => { const sel = presets.find(pr => pr.key === selectedPreset); return sel ? `Phase 0: Architecture → Phase 1: ${sel.agentCount} Agents → Phase 2: Report` : 'Phase 0: Architecture → Phase 1: Agents → Phase 2: Report'; })()}
               </p>
             </div>
           </div>
