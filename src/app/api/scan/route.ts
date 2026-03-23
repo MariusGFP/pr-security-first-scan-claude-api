@@ -248,21 +248,84 @@ function discoverModules(repoDir: string): CodeModule[] {
     return [{ name: 'full-repo', dirs: ['.'], lines: totalLines, files: allFiles }];
   }
 
-  // Target: 3-5 modules, each 15k-60k lines
-  const TARGET_MODULE_LINES = Math.max(15000, Math.ceil(totalLines / 5));
+  // Target: 8-10 modules of ~15k lines each for thorough per-agent review
+  const TARGET_MODULE_LINES = Math.max(10000, Math.ceil(totalLines / 10));
   const modules: CodeModule[] = [];
   let currentModule: CodeModule = { name: '', dirs: [], lines: 0, files: [] };
 
   for (const dir of dirStats) {
-    // Large dir becomes its own module
+    // Large dir: split into subdirectories if it exceeds the target
     if (dir.lines >= TARGET_MODULE_LINES) {
+      // Flush any accumulated small dirs first
       if (currentModule.dirs.length > 0) {
         currentModule.name = currentModule.dirs.length === 1 ? currentModule.dirs[0] : currentModule.dirs.slice(0, 2).join('+');
         modules.push(currentModule);
         currentModule = { name: '', dirs: [], lines: 0, files: [] };
       }
-      const dirFiles = collectSourceFiles(path.join(repoDir, dir.name), repoDir);
-      modules.push({ name: dir.name, dirs: [dir.name], lines: dir.lines, files: dirFiles });
+
+      // Try to split large directory by its subdirectories
+      const subEntries = fs.readdirSync(path.join(repoDir, dir.name), { withFileTypes: true });
+      const subDirStats: { name: string; relPath: string; lines: number }[] = [];
+      let dirRootLines = 0;
+
+      for (const sub of subEntries) {
+        if (sub.isDirectory() && !SKIP_DIRS.has(sub.name)) {
+          const subLines = countDirLines(path.join(repoDir, dir.name, sub.name));
+          if (subLines > 0) subDirStats.push({ name: sub.name, relPath: `${dir.name}/${sub.name}`, lines: subLines });
+        } else if (sub.isFile() && ALL_SCANNABLE_EXTENSIONS.has(path.extname(sub.name).toLowerCase()) && !SKIP_FILES.has(sub.name)) {
+          dirRootLines += countLines(path.join(repoDir, dir.name, sub.name));
+        }
+      }
+
+      // Only split if there are enough subdirs to make it worthwhile
+      if (subDirStats.length >= 2) {
+        subDirStats.sort((a, b) => b.lines - a.lines);
+        let subModule: CodeModule = { name: '', dirs: [], lines: 0, files: [] };
+
+        for (const sub of subDirStats) {
+          // Large subdir becomes its own module
+          if (sub.lines >= TARGET_MODULE_LINES) {
+            if (subModule.dirs.length > 0) {
+              subModule.name = subModule.dirs.length === 1 ? subModule.dirs[0].replace('/', '-') : subModule.dirs.slice(0, 2).map(d => d.split('/').pop()).join('+');
+              modules.push(subModule);
+              subModule = { name: '', dirs: [], lines: 0, files: [] };
+            }
+            const subFiles = collectSourceFiles(path.join(repoDir, sub.relPath), repoDir);
+            modules.push({ name: sub.relPath.replace('/', '-'), dirs: [sub.relPath], lines: sub.lines, files: subFiles });
+            continue;
+          }
+
+          subModule.dirs.push(sub.relPath);
+          subModule.lines += sub.lines;
+          subModule.files.push(...collectSourceFiles(path.join(repoDir, sub.relPath), repoDir));
+
+          if (subModule.lines >= TARGET_MODULE_LINES) {
+            subModule.name = subModule.dirs.length === 1 ? subModule.dirs[0].replace('/', '-') : subModule.dirs.slice(0, 2).map(d => d.split('/').pop()).join('+');
+            modules.push(subModule);
+            subModule = { name: '', dirs: [], lines: 0, files: [] };
+          }
+        }
+
+        // Add root-level files of the large dir to the last sub-module
+        if (dirRootLines > 0) {
+          for (const sub of subEntries) {
+            if (sub.isFile() && ALL_SCANNABLE_EXTENSIONS.has(path.extname(sub.name).toLowerCase()) && !SKIP_FILES.has(sub.name)) {
+              subModule.files.push(path.relative(repoDir, path.join(repoDir, dir.name, sub.name)));
+            }
+          }
+          subModule.dirs.push(dir.name);
+          subModule.lines += dirRootLines;
+        }
+
+        if (subModule.dirs.length > 0) {
+          subModule.name = subModule.dirs.length === 1 ? subModule.dirs[0].replace('/', '-') : subModule.dirs.slice(0, 2).map(d => d.split('/').pop()).join('+');
+          modules.push(subModule);
+        }
+      } else {
+        // Not enough subdirs to split — keep as single module
+        const dirFiles = collectSourceFiles(path.join(repoDir, dir.name), repoDir);
+        modules.push({ name: dir.name, dirs: [dir.name], lines: dir.lines, files: dirFiles });
+      }
       continue;
     }
 
@@ -300,14 +363,14 @@ function discoverModules(repoDir: string): CodeModule[] {
     }
   }
 
-  // Cap at 5 modules — merge smallest if over
-  while (modules.length > 5) {
+  // Cap at 10 modules — merge smallest if over
+  while (modules.length > 10) {
     modules.sort((a, b) => a.lines - b.lines);
     const smallest = modules.shift()!;
     modules[0].dirs.push(...smallest.dirs);
     modules[0].lines += smallest.lines;
     modules[0].files.push(...smallest.files);
-    modules[0].name = modules[0].dirs.slice(0, 2).join('+');
+    modules[0].name = modules[0].dirs.slice(0, 2).map(d => d.split('/').pop()).join('+');
   }
 
   return modules;
@@ -590,9 +653,12 @@ Format per finding:
 
 End with a MANDATORY Coverage Report:
 ### Coverage Report
+For EVERY file you reviewed, output exactly this marker line (one per file):
+[REVIEWED] path/to/file.ts | findings: N
+- "path/to/file.ts" must be the exact relative path from the manifest
+- "findings: N" is the number of issues found (0 if clean)
+
 **Files reviewed**: X / ${mod.files.length}
-**Files with findings**: [list]
-**Files reviewed, no issues**: [list]
 **Files NOT reviewed**: [list — MUST be empty for a complete audit]
 If no issues found: "✅ No ${agent.name} issues found in ${mod.name}."
 
@@ -722,9 +788,12 @@ If no issues found: "✅ No ${agent.name} issues found."
 
 End with a MANDATORY Coverage Report:
 ### Coverage Report
+For EVERY file you reviewed, output exactly this marker line (one per file):
+[REVIEWED] path/to/file.ts | findings: N
+- "path/to/file.ts" must be the exact relative path from the manifest
+- "findings: N" is the number of issues found (0 if clean)
+
 **Files reviewed**: X / ${totalFiles}
-**Files with findings**: [list]
-**Files reviewed, no issues**: [list]
 **Files NOT reviewed**: [list — should be empty for a complete audit, or explain why skipped]
 
 OUTPUT INSTRUCTIONS (MANDATORY):
@@ -793,7 +862,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   const results = await Promise.all(agentPromises);
 
   // ── Phase 1.5: Coverage Verification ──
-  // Check which files from the manifest appear in agent reports
+  // Parse [REVIEWED] markers from agent reports for reliable coverage tracking
   // Coverage % only counts code files (not config like .json, .yaml)
   const allReportText = results
     .filter(r => r.result.success)
@@ -815,25 +884,43 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     }
   }
 
-  // Count duplicate basenames to avoid false-positive matching
-  const basenameCounts = new Map<string, number>();
-  for (const file of allSourceFiles) {
-    const bn = path.basename(file);
-    basenameCounts.set(bn, (basenameCounts.get(bn) || 0) + 1);
+  // Primary: parse explicit [REVIEWED] markers from agent reports
+  const reviewedPattern = /\[REVIEWED\]\s+(.+?)\s+\|/g;
+  let match;
+  while ((match = reviewedPattern.exec(allReportText))) {
+    const reviewedPath = match[1].trim();
+    if (allSourceFiles.has(reviewedPath)) {
+      coveredFiles.add(reviewedPath);
+    }
+  }
+
+  // Fallback: for agents that didn't use markers, check text mentions
+  // This ensures backward compatibility and catches partial compliance
+  if (coveredFiles.size < allSourceFiles.size * 0.5) {
+    // Count duplicate basenames to avoid false-positive matching
+    const basenameCounts = new Map<string, number>();
+    for (const file of allSourceFiles) {
+      const bn = path.basename(file);
+      basenameCounts.set(bn, (basenameCounts.get(bn) || 0) + 1);
+    }
+
+    for (const file of allSourceFiles) {
+      if (coveredFiles.has(file)) continue;
+      // Check if the full relative path appears in any report
+      if (allReportText.includes(file)) {
+        coveredFiles.add(file);
+        continue;
+      }
+      // Only use basename if it's unique in the repo
+      const basename = path.basename(file);
+      if (basenameCounts.get(basename) === 1 && allReportText.includes(basename)) {
+        coveredFiles.add(file);
+      }
+    }
   }
 
   for (const file of allSourceFiles) {
-    // Primary: check if the full relative path appears in any report
-    if (allReportText.includes(file)) {
-      coveredFiles.add(file);
-      continue;
-    }
-    // Fallback: only use basename if it's unique in the repo (avoids false positives
-    // from common names like index.ts, types.ts, utils.ts)
-    const basename = path.basename(file);
-    if (basenameCounts.get(basename) === 1 && allReportText.includes(basename)) {
-      coveredFiles.add(file);
-    } else {
+    if (!coveredFiles.has(file)) {
       uncoveredFiles.push(file);
     }
   }
@@ -884,8 +971,13 @@ For each file:
 
 If a file has no issues: "✅ ${'{file}'} — no issues found"
 
+For EVERY file you reviewed, output exactly this marker line (one per file):
+[REVIEWED] path/to/file.ts | findings: N
+- "path/to/file.ts" must be the exact relative path
+- "findings: N" is the number of issues found (0 if clean)
+
 Begin with: ## Coverage Gap Analysis
-End with a list of ALL files you reviewed.
+End with a list of ALL [REVIEWED] markers.
 
 OUTPUT INSTRUCTIONS (MANDATORY):
 1. Write your COMPLETE report to this file: ${gapOutputFile}
@@ -974,6 +1066,21 @@ NOTE: This code may have been partially or fully generated by AI without thoroug
 
 ⚠️ CRITICAL: Your report MUST include an "Audit Coverage Summary" section at the end. A report WITHOUT the coverage summary is INCOMPLETE.
 
+CONFIDENCE HANDLING:
+- 🔒 CONFIRMED = proven issue with concrete evidence (file:line, code snippet, reproducible)
+- ⚠️ POTENTIAL = likely issue but needs verification (runtime behavior, configuration-dependent)
+- 🔍 NEEDS-VERIFICATION = theoretical, depends on deployment/runtime/usage patterns
+- When in doubt between CONFIRMED and POTENTIAL, keep POTENTIAL
+
+🔴 CRITICAL FINDING CROSS-VALIDATION (MANDATORY):
+For EVERY 🔴 Critical finding, you MUST verify before including it in the report:
+1. **Evidence present?** — Does the agent provide concrete evidence: file:line references, code snippets, and clear impact description? If no evidence → downgrade to 🟡 Warning.
+2. **Compensation check done?** — Did the agent check for middleware, framework defaults, base classes, or existing safeguards? If no compensation check → downgrade to ⚠️ POTENTIAL.
+3. **Cross-agent consistency** — If Agent A flags a Critical in code area X, but Agent B also analyzed area X and found no issue → downgrade to ⚠️ POTENTIAL (conflicting evidence).
+4. **Framework default awareness** — If the finding is about something the framework handles by default (React XSS, ORM SQL injection, Next.js CSRF, Laravel validation) and the agent didn't prove a bypass → downgrade to 🟡 Warning.
+5. **Test/dev only** — If the finding is only in test files, seed scripts, mock data, or dev-only code → downgrade to 🔵 Info.
+Only Criticals that survive all 5 checks remain 🔴 Critical in the final report.
+
 RULES:
 1. Executive Summary at top with TWO counts:
    - CONFIRMED findings: X 🔴 Critical, Y 🟡 Warning, Z 🔵 Info
@@ -1001,6 +1108,9 @@ Framework: ${frameworkInfo}
 
 ### Requiring Verification
 ⚠️ X Potential | 🔍 Y Needs Verification
+
+### False Positive Prevention
+This audit uses a three-tier confidence system. POTENTIAL and NEEDS-VERIFICATION findings should be verified before action. All 🔴 Critical findings have been cross-validated (see CRITICAL FINDING CROSS-VALIDATION rules).
 
 ## Findings by Category
 

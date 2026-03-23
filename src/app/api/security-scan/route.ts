@@ -10,6 +10,51 @@ import path from 'path';
 
 const PROMPTS_BASE_DIR = path.join(process.cwd(), 'prompts', 'security-scan');
 
+// ── File collection constants (shared with scan route) ──
+const SKIP_DIRS = new Set([
+  'node_modules', '.git', '.next', 'dist', 'build', 'vendor', 'storage',
+  '.idea', '.vscode', '__pycache__', '.cache', 'coverage', '.turbo',
+]);
+
+const CODE_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.php', '.py', '.rb', '.java', '.go',
+  '.rs', '.vue', '.svelte', '.cs', '.swift', '.kt', '.scala', '.ex', '.exs',
+  '.twig', '.hbs', '.ejs', '.pug',
+]);
+
+const CONFIG_EXTENSIONS = new Set([
+  '.json', '.yaml', '.yml', '.xml', '.toml',
+]);
+
+const ALL_SCANNABLE_EXTENSIONS = new Set([...CODE_EXTENSIONS, ...CONFIG_EXTENSIONS]);
+
+const SKIP_FILES = new Set([
+  'package-lock.json', 'composer.lock', 'yarn.lock', 'pnpm-lock.yaml',
+  'bun.lockb', 'Gemfile.lock', 'poetry.lock', 'Cargo.lock',
+  'phpunit.xml.dist', '.phpunit.result.cache',
+]);
+
+/**
+ * Collect all source files in a directory recursively.
+ * Returns paths relative to baseDir.
+ */
+function collectSourceFiles(dirPath: string, baseDir: string): string[] {
+  const files: string[] = [];
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...collectSourceFiles(fullPath, baseDir));
+      } else if (ALL_SCANNABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && !SKIP_FILES.has(entry.name)) {
+        files.push(path.relative(baseDir, fullPath));
+      }
+    }
+  } catch { /* ignore */ }
+  return files;
+}
+
 /**
  * Pre-flight checks before starting a security scan.
  * Returns an array of error messages. Empty = all checks passed.
@@ -344,6 +389,34 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   fs.writeFileSync(path.join(auditDir, '00-architecture-map.md'), architectureMap);
   logAndBroadcast(`  [Security] 📁 Audit folder: ${auditDir}`);
 
+  // ── Phase 0.5: File Manifest (collect all source files across all repos) ──
+  const allSourceFiles = new Set<string>();
+  const perRepoFiles = new Map<string, string[]>();
+
+  for (let i = 0; i < repos.length; i++) {
+    const repoPath = repoFullPaths ? repoFullPaths[i] : path.join(reposDir, repos[i]);
+    const repoFiles = collectSourceFiles(repoPath, repoPath).map(f => `${repos[i]}/${f}`);
+    perRepoFiles.set(repos[i], repoFiles);
+    for (const f of repoFiles) allSourceFiles.add(f);
+  }
+
+  const totalFiles = allSourceFiles.size;
+  const manifestContent = Array.from(perRepoFiles.entries())
+    .map(([repo, files]) => `## Repo: ${repo} (${files.length} files)\n${files.map(f => `- ${f}`).join('\n')}`)
+    .join('\n\n');
+  fs.writeFileSync(path.join(auditDir, '00-file-manifest.md'), `# File Manifest\nTotal: ${totalFiles} source files across ${repos.length} repos\n\n${manifestContent}`);
+  logAndBroadcast(`  [Security] 📋 File Manifest: ${totalFiles} source files across ${repos.length} repos`);
+
+  // Build file manifest block for agent prompts
+  const MAX_INLINE_FILES = 300;
+  const allFilesList = Array.from(allSourceFiles);
+  let fileManifestBlock: string;
+  if (totalFiles <= MAX_INLINE_FILES) {
+    fileManifestBlock = `\n📋 FILE MANIFEST (${totalFiles} files — you MUST review ALL of these):\n${allFilesList.map(f => `- ${f}`).join('\n')}`;
+  } else {
+    fileManifestBlock = `\n📋 FILE MANIFEST (${totalFiles} files — you MUST review ALL of these):\nFirst ${MAX_INLINE_FILES} files listed here, full list in: ${path.join(auditDir, '00-file-manifest.md')}\n${allFilesList.slice(0, MAX_INLINE_FILES).map(f => `- ${f}`).join('\n')}\n... and ${totalFiles - MAX_INLINE_FILES} more (see manifest file)`;
+  }
+
   // ── Phase 1: 8 Security Agents parallel ──
   logAndBroadcast(`  [Security] Phase 1: ${SCAN_AGENTS.length} Security Agents parallel (${modelInfo.name}, ${presetName})...`);
   agentStatus.forEach(a => a.status = 'running' as any);
@@ -363,6 +436,19 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 
     const outputFile = path.join(auditDir, `${agent.id}.md`);
     const fullPrompt = `${basePrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nYou have full access to ALL files. Navigate to the paths listed above to analyze each repo.
+${fileManifestBlock}
+
+Read EVERY file from the manifest above — start with the directory structure then dive into each file.
+
+End with a MANDATORY Coverage Report:
+### Coverage Report
+For EVERY file you reviewed, output exactly this marker line (one per file):
+[REVIEWED] repo-name/path/to/file.ts | findings: N
+- The path must be the exact relative path from the manifest (repo-name/path/to/file.ts)
+- "findings: N" is the number of issues found (0 if clean)
+
+**Files reviewed**: X / ${totalFiles}
+**Files NOT reviewed**: [list — MUST be empty for a complete audit]
 
 OUTPUT INSTRUCTIONS (MANDATORY):
 1. Write your COMPLETE report to this file: ${outputFile}
@@ -450,6 +536,137 @@ OUTPUT INSTRUCTIONS (MANDATORY):
         }
       }
     }
+  }
+
+  // ── Phase 1.5: Coverage Verification ──
+  // Parse [REVIEWED] markers from agent reports for reliable coverage tracking
+  const allReportText = results
+    .filter(r => r.result.success)
+    .map(r => r.result.result || '')
+    .join('\n');
+
+  const coveredFiles = new Set<string>();
+
+  // Separate code files from config files for coverage calculation
+  const codeFiles: string[] = [];
+  const configFiles: string[] = [];
+  for (const file of allSourceFiles) {
+    const ext = path.extname(file).toLowerCase();
+    if (CONFIG_EXTENSIONS.has(ext)) {
+      configFiles.push(file);
+    } else {
+      codeFiles.push(file);
+    }
+  }
+
+  // Primary: parse explicit [REVIEWED] markers from agent reports
+  const reviewedPattern = /\[REVIEWED\]\s+(.+?)\s+\|/g;
+  let reviewMatch;
+  while ((reviewMatch = reviewedPattern.exec(allReportText))) {
+    const reviewedPath = reviewMatch[1].trim();
+    if (allSourceFiles.has(reviewedPath)) {
+      coveredFiles.add(reviewedPath);
+    }
+  }
+
+  // Fallback: for agents that didn't use markers, check text mentions
+  if (coveredFiles.size < allSourceFiles.size * 0.5) {
+    const basenameCounts = new Map<string, number>();
+    for (const file of allSourceFiles) {
+      const bn = path.basename(file);
+      basenameCounts.set(bn, (basenameCounts.get(bn) || 0) + 1);
+    }
+
+    for (const file of allSourceFiles) {
+      if (coveredFiles.has(file)) continue;
+      if (allReportText.includes(file)) {
+        coveredFiles.add(file);
+        continue;
+      }
+      const basename = path.basename(file);
+      if (basenameCounts.get(basename) === 1 && allReportText.includes(basename)) {
+        coveredFiles.add(file);
+      }
+    }
+  }
+
+  const uncoveredFiles: string[] = [];
+  for (const file of allSourceFiles) {
+    if (!coveredFiles.has(file)) uncoveredFiles.push(file);
+  }
+
+  const coveredCodeFiles = codeFiles.filter(f => coveredFiles.has(f));
+  const uncoveredCodeFiles = codeFiles.filter(f => !coveredFiles.has(f));
+  const coveragePercent = codeFiles.length > 0 ? Math.round((coveredCodeFiles.length / codeFiles.length) * 100) : 100;
+  logAndBroadcast(`  [Security] 📊 Coverage Check: ${coveredCodeFiles.length}/${codeFiles.length} code files mentioned in reports (${coveragePercent}%) + ${configFiles.length} config files`);
+
+  if (uncoveredCodeFiles.length > 0) {
+    logAndBroadcast(`  [Security] ⚠️ ${uncoveredCodeFiles.length} code files NOT mentioned in any agent report`);
+  }
+
+  // Save coverage report
+  const coverageReport = `# Coverage Verification Report\n\nDate: ${new Date().toISOString()}\nTotal files: ${totalFiles} (${codeFiles.length} code + ${configFiles.length} config)\nCode files covered: ${coveredCodeFiles.length}/${codeFiles.length} (${coveragePercent}%)\nUncovered code files: ${uncoveredCodeFiles.length}\n\n## Uncovered Code Files\n${uncoveredCodeFiles.length > 0 ? uncoveredCodeFiles.map(f => `- ${f}`).join('\n') : '✅ All code files covered!'}\n\n## Config Files (not counted for coverage %)\n${configFiles.map(f => `- ${f} ${coveredFiles.has(f) ? '✅' : '—'}`).join('\n')}\n`;
+  fs.writeFileSync(path.join(auditDir, '00-coverage-verification.md'), coverageReport);
+
+  // ── Phase 1.6: Coverage Gap Agent (if significant gaps exist) ──
+  let gapAgentResult = '';
+  if (!aborted && uncoveredCodeFiles.length > 0 && coveragePercent < 90) {
+    const MAX_GAP_FILES = 100;
+    const gapFiles = uncoveredCodeFiles.slice(0, MAX_GAP_FILES);
+    logAndBroadcast(`  [Security] 🔍 Running Coverage Gap Agent for ${gapFiles.length} uncovered code files...`);
+    broadcastScanProgress(scanId, { phase: 'coverage-gap', agents: agentStatus, totalCost });
+
+    const gapOutputFile = path.join(auditDir, '00-coverage-gaps.md');
+    const gapResult = await runClaudeAgentic(
+      `You are a Coverage Gap Agent for the security audit of "${platformName}".
+
+The main security agents MISSED the following ${gapFiles.length} files. Your job is to review them for security issues.
+
+Repos (Name: Path):
+${repoPathsList}
+
+⚠️ FILES TO REVIEW (these were missed by all other agents):
+${gapFiles.map(f => `- ${f}`).join('\n')}
+
+For each file:
+1. Read the file
+2. Check for: authentication issues, injection vulnerabilities, secrets exposure, IDOR, access control, OWASP Top 10
+3. Report any findings with the standard format:
+   - **Severity**: 🔴 Critical / 🟡 Warning / 🔵 Info
+   - **Confidence**: 🔒 CONFIRMED / ⚠️ POTENTIAL / 🔍 NEEDS-VERIFICATION
+   - **File:Line**: Description
+   - **Fix Suggestion**: Concrete code
+
+If a file has no issues: "✅ ${'{file}'} — no issues found"
+
+For EVERY file you reviewed, output exactly this marker line (one per file):
+[REVIEWED] repo-name/path/to/file.ts | findings: N
+- The path must be the exact relative path
+- "findings: N" is the number of issues found (0 if clean)
+
+Begin with: ## Coverage Gap Analysis
+End with a list of ALL [REVIEWED] markers.
+
+OUTPUT INSTRUCTIONS (MANDATORY):
+1. Write your COMPLETE report to this file: ${gapOutputFile}
+2. Do NOT write files to any other location.
+3. Your text response should be a brief summary only — the detailed report goes in the file.`,
+      workingDir,
+      AGENT_TIMEOUT_MS,
+      model
+    );
+
+    totalCost += gapResult.cost;
+
+    gapAgentResult = gapResult.success ? gapResult.result : '';
+    if (fs.existsSync(gapOutputFile)) {
+      const fileContent = fs.readFileSync(gapOutputFile, 'utf8');
+      if (fileContent.length > gapAgentResult.length) {
+        gapAgentResult = fileContent;
+      }
+    }
+
+    logAndBroadcast(`  [Security] ✅ Coverage Gap Agent done (${gapAgentResult.length} chars, $${gapResult.cost.toFixed(2)})`);
   }
 
   // ── Phase 2: Aggregation (grouped by repo) ──
