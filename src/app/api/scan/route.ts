@@ -472,8 +472,10 @@ async function runFullScan(
   let totalCost = 0;
   let aborted = false;
   const modelInfo = AVAILABLE_MODELS[model];
+  // Sub-agents and merge always use Sonnet (fast + cheap), only aggregation uses selected model
+  const agentModel: ModelKey = 'sonnet';
   const AGENT_TIMEOUT = 600000;    // 10 min per agent
-  const MAX_SCAN_DURATION_MS = 45 * 60 * 1000; // 45 min total
+  const MAX_SCAN_DURATION_MS = 90 * 60 * 1000; // 90 min total (generous for large repos)
   const promptsDir = getPromptsDir(framework);
   const frameworkName = FRAMEWORK_PRESETS[framework]?.name || 'Auto-Detect';
 
@@ -510,7 +512,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. Your text response should be a brief summary only — the detailed map goes in the file.`,
     repoDir,
     AGENT_TIMEOUT,
-    model
+    agentModel
   );
 
   totalCost += detectionResult.cost;
@@ -574,7 +576,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     ? deepAgentCount * modules.length + SCAN_AGENTS.filter(a => !a.deep).length
     : SCAN_AGENTS.length;
 
-  logAndBroadcast(`  [Scan] Phase 1: ${SCAN_AGENTS.length} Agents${useSubAgents ? ` (${totalSubAgents} total sub-agents)` : ''} on ${repoName} (${modelInfo.name}, agentic mode)...`);
+  logAndBroadcast(`  [Scan] Phase 1: ${SCAN_AGENTS.length} Agents${useSubAgents ? ` (${totalSubAgents} total sub-agents)` : ''} on ${repoName} (${AVAILABLE_MODELS[agentModel].name} agents, ${modelInfo.name} aggregation)...`);
   agentStatus.forEach(a => a.status = 'running');
   broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus });
 
@@ -668,52 +670,73 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. The file must contain your FULL detailed analysis with all findings, not just a summary.
 4. Your text response should be a brief summary only — the detailed report goes in the file.`;
 
-        return { promise: runClaudeAgentic(subPrompt, repoDir, AGENT_TIMEOUT, model), outputFile: subOutputFile };
+        return { promise: runClaudeAgentic(subPrompt, repoDir, AGENT_TIMEOUT, agentModel), outputFile: subOutputFile };
       });
 
       const subResults = await Promise.all(subPromises.map(s => s.promise));
       let agentCost = 0;
-      const subOutputs: string[] = [];
+      const subOutputs: string[] = new Array(modules.length).fill('');
+      const subRecovered: boolean[] = new Array(modules.length).fill(false);
       let successfulSubCount = 0;
 
+      // Collect costs from CLI results
       for (let i = 0; i < subResults.length; i++) {
-        let sub = subResults[i];
-        agentCost += sub.cost;
-        totalCost += sub.cost;
-
-        // Check if sub-agent wrote a file (preferred over result text)
-        const subFile = subPromises[i].outputFile;
-        if (fs.existsSync(subFile)) {
-          const fileContent = fs.readFileSync(subFile, 'utf8');
-          if (fileContent.length > (sub.result || '').length) {
-            logAndBroadcast(`    [${agent.id}] 📄 Sub-agent ${modules[i].name}: using file output (${fileContent.length} chars)`);
-            const fileSuccess = sub.success || fileContent.length >= MIN_OUTPUT_CHARS;
-            sub = { ...sub, result: fileContent, success: fileSuccess };
-          }
-        }
-
-        if (sub.success) {
-          subOutputs.push(sub.result);
-          successfulSubCount++;
-        } else {
-          subOutputs.push(`## ${agent.name} — Module: ${modules[i].name}\n❌ Sub-agent failed: ${(sub.result || '').substring(0, 200)}`);
-        }
+        agentCost += subResults[i].cost;
+        totalCost += subResults[i].cost;
       }
 
-      // Second pass: recover files written by killed sub-agents (race condition safety)
-      // When a Claude CLI process is SIGKILL'd, its file write may complete moments after
-      // the error callback fires, causing fs.existsSync to miss the file in the first pass.
-      for (let i = 0; i < subResults.length; i++) {
-        if (subOutputs[i].includes('❌ Sub-agent failed')) {
+      // File-first recovery: the sub-agent output FILE is the source of truth.
+      // CLI process may report failure (SIGKILL timeout) but the file was already written.
+      // We check files with retries to handle the race condition where SIGKILL fires
+      // moments before the file write completes.
+      const MAX_FILE_RECOVERY_ATTEMPTS = 3;
+      const FILE_RECOVERY_DELAY_MS = 5000; // 5 seconds between attempts
+
+      for (let attempt = 0; attempt < MAX_FILE_RECOVERY_ATTEMPTS; attempt++) {
+        let allRecovered = true;
+
+        for (let i = 0; i < modules.length; i++) {
+          if (subRecovered[i]) continue; // Already recovered
+          allRecovered = false;
+
           const subFile = subPromises[i].outputFile;
           if (fs.existsSync(subFile)) {
             const fileContent = fs.readFileSync(subFile, 'utf8');
             if (fileContent.length >= MIN_OUTPUT_CHARS) {
-              logAndBroadcast(`    [${agent.id}] 📄 Sub-agent ${modules[i].name}: late file recovery (${fileContent.length} chars)`);
               subOutputs[i] = fileContent;
+              subRecovered[i] = true;
               successfulSubCount++;
+              if (!subResults[i].success) {
+                logAndBroadcast(`    [${agent.id}] 📄 Sub-agent ${modules[i].name}: file recovery (${fileContent.length} chars, attempt ${attempt + 1})`);
+              } else {
+                logAndBroadcast(`    [${agent.id}] 📄 Sub-agent ${modules[i].name}: using file output (${fileContent.length} chars)`);
+              }
+              continue;
             }
           }
+
+          // No file yet — fall back to CLI result if it was successful
+          if (subResults[i].success && (subResults[i].result || '').length >= MIN_OUTPUT_CHARS) {
+            subOutputs[i] = subResults[i].result;
+            subRecovered[i] = true;
+            successfulSubCount++;
+          }
+        }
+
+        if (allRecovered || successfulSubCount === modules.length) break;
+
+        // Wait before next attempt (skip wait on last attempt)
+        if (attempt < MAX_FILE_RECOVERY_ATTEMPTS - 1) {
+          const missing = modules.length - successfulSubCount;
+          logAndBroadcast(`    [${agent.id}] ⏳ ${missing} sub-agent file(s) not yet on disk, waiting ${FILE_RECOVERY_DELAY_MS / 1000}s... (attempt ${attempt + 1}/${MAX_FILE_RECOVERY_ATTEMPTS})`);
+          await new Promise(r => setTimeout(r, FILE_RECOVERY_DELAY_MS));
+        }
+      }
+
+      // Mark any still-missing sub-agents
+      for (let i = 0; i < modules.length; i++) {
+        if (!subRecovered[i]) {
+          subOutputs[i] = `## ${agent.name} — Module: ${modules[i].name}\n❌ Sub-agent failed: no file output and CLI returned error`;
         }
       }
 
@@ -723,12 +746,11 @@ OUTPUT INSTRUCTIONS (MANDATORY):
         aborted = true;
       }
 
-      // Merge sub-agent results
+      // Merge sub-agent results (skip if no successful sub-agents or aborted)
       let mergedResult = subOutputs.join('\n\n---\n\n');
 
-      // If >2 sub-agents, do a per-agent merge to deduplicate (skip if aborted)
-      if (modules.length > 2 && !aborted) {
-        logAndBroadcast(`    [${agent.id}] Merging ${modules.length} sub-agent results...`);
+      if (successfulSubCount > 0 && modules.length > 2 && !aborted) {
+        logAndBroadcast(`    [${agent.id}] Merging ${successfulSubCount}/${modules.length} sub-agent results...`);
         const mergeResult = await runClaudeAgentic(
           `Merge the following ${modules.length} sub-agent reports for the ${agent.name} analysis of ${repoFullName}.
 
@@ -740,7 +762,7 @@ Begin with: ## ${agent.name}
 ${mergedResult}`,
           repoDir,
           AGENT_TIMEOUT,
-          model
+          agentModel
         );
         agentCost += mergeResult.cost;
         totalCost += mergeResult.cost;
@@ -808,13 +830,41 @@ OUTPUT INSTRUCTIONS (MANDATORY):
       return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 } };
     }
 
-    let result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, model);
+    let result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, agentModel);
     totalCost += result.cost;
 
     // Check time limit after each agent
     if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
       logAndBroadcast(`  [Scan] 🛑 TIME LIMIT (${Math.round((Date.now() - startTime) / 60000)}min). Remaining agents skipped.`);
       aborted = true;
+    }
+
+    // File-first: check if agent wrote output file BEFORE considering retries
+    // The CLI may report failure (timeout/SIGKILL) but the file was already written.
+    const checkFileOutput = (): boolean => {
+      if (fs.existsSync(outputFile)) {
+        const fileContent = fs.readFileSync(outputFile, 'utf8');
+        const currentLen = (result.result || '').length;
+        // Use file if: (1) CLI failed and file is sufficient, or (2) file is larger than CLI result
+        if (fileContent.length >= MIN_OUTPUT_CHARS && (!result.success || fileContent.length > currentLen)) {
+          logAndBroadcast(`  [Scan] 📄 ${agent.name}: using file output (${fileContent.length} chars)${!result.success ? ' (CLI reported error but file exists)' : ''}`);
+          result = { ...result, result: fileContent, success: true };
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // Check file immediately — skip retries if file already exists
+    if (!result.success || (result.result || '').length < MIN_OUTPUT_CHARS) {
+      // Wait briefly for file write to complete after SIGKILL
+      if (!checkFileOutput()) {
+        await new Promise(r => setTimeout(r, 5000));
+        checkFileOutput();
+      }
+    } else {
+      // CLI succeeded, but still prefer file output if larger
+      checkFileOutput();
     }
 
     let attempt = 1;
@@ -825,22 +875,24 @@ OUTPUT INSTRUCTIONS (MANDATORY):
       agentStatus[idx] = { ...agentStatus[idx], status: 'retrying', attempt };
       broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
       await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
-      result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, model);
+      result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, agentModel);
       totalCost += result.cost;
+
+      // Check file after each retry attempt
+      if (!result.success || (result.result || '').length < MIN_OUTPUT_CHARS) {
+        if (!checkFileOutput()) {
+          await new Promise(r => setTimeout(r, 5000));
+          checkFileOutput();
+        }
+      } else {
+        checkFileOutput();
+      }
 
       if (Date.now() - startTime > MAX_SCAN_DURATION_MS) {
         logAndBroadcast(`  [Scan] 🛑 Time limit reached during retry. Stopping retries for ${agent.name}.`);
         aborted = true;
-      }
-    }
-
-    // Check if agent wrote a file (preferred) — use file content over result text
-    if (fs.existsSync(outputFile)) {
-      const fileContent = fs.readFileSync(outputFile, 'utf8');
-      if (fileContent.length > (result.result || '').length) {
-        logAndBroadcast(`  [Scan] 📄 ${agent.name}: using file output (${fileContent.length} chars) over result text (${(result.result || '').length} chars)`);
-        const fileSuccess = result.success || fileContent.length >= MIN_OUTPUT_CHARS;
-        result = { ...result, result: fileContent, success: fileSuccess };
+        // Final file check even when aborting
+        checkFileOutput();
       }
     }
 
@@ -985,7 +1037,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. Your text response should be a brief summary only — the detailed report goes in the file.`,
       repoDir,
       AGENT_TIMEOUT,
-      model
+      agentModel
     );
 
     totalCost += gapResult.cost;
