@@ -2,7 +2,7 @@ export const dynamic = 'force-dynamic';
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb, getRepoById, addCost } from '@/lib/db';
-import { runClaudeAgentic, AVAILABLE_MODELS, type ModelKey, getKeyValue } from '@/lib/claude';
+import { runClaudeWithTools, AVAILABLE_MODELS, type ModelKey, getKeyValue } from '@/lib/claude';
 import { logAndBroadcast, broadcastScanProgress } from '@/lib/websocket';
 import { execSync } from 'child_process';
 import fs from 'fs';
@@ -503,7 +503,9 @@ async function runFullScan(
   if (!fs.existsSync(detectionOutputDir)) fs.mkdirSync(detectionOutputDir, { recursive: true });
   const detectionOutputFile = path.join(detectionOutputDir, `_detection-${scanId}.md`);
 
-  const detectionResult = await runClaudeAgentic(
+  const auditsBaseDir = getAuditsDir(); // Shared allowed write dir for all agent calls
+
+  const detectionResult = await runClaudeWithTools(
     `${detectionPrompt}\n\nRepository path: ${repoDir}\n\n${claudeMd ? `Existing CLAUDE.md content:\n${claudeMd}` : 'No CLAUDE.md found — detect everything from source.'}
 
 OUTPUT INSTRUCTIONS (MANDATORY):
@@ -512,7 +514,9 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. Your text response should be a brief summary only — the detailed map goes in the file.`,
     repoDir,
     AGENT_TIMEOUT,
-    agentModel
+    agentModel,
+    undefined, // no cache prefix for detection
+    [auditsBaseDir]
   );
 
   totalCost += detectionResult.cost;
@@ -570,6 +574,24 @@ OUTPUT INSTRUCTIONS (MANDATORY):
   fs.writeFileSync(path.join(auditDir, '00-file-manifest.md'), `# File Manifest\nTotal: ${totalFiles} source files\n\n${manifestContent}`);
   logAndBroadcast(`  [Scan] 📁 Audit folder: ${auditDir}`);
 
+  // ── Build shared cache prefix for prompt caching across all agents ──
+  // This block is identical for all 10 agents → first agent writes cache, 9 read from cache (90% cheaper).
+  // Multi-turn caching also kicks in: conversation history within each agent is cached between turns.
+  const scanCachePrefix = [
+    `## Architecture Map`,
+    architectureMap.substring(0, 15000),
+    ``,
+    `## Repository Context`,
+    `Repository: ${repoFullName}`,
+    `Path: ${repoDir}`,
+    `Framework: ${frameworkInfo}`,
+    `CONTEXT: This is a FULL CODEBASE first scan (NOT a PR review, NOT a diff review).`,
+    ``,
+    `## File Manifest (${totalFiles} source files)`,
+    manifestContent,
+  ].join('\n');
+  logAndBroadcast(`  [Scan] Cache-Prefix: ${Math.round(scanCachePrefix.length / 1024)}KB (shared across all agents for prompt caching)`);
+
   // ── Phase 1: Run agents (with sub-agents for deep agents on large repos) ──
   const deepAgentCount = SCAN_AGENTS.filter(a => a.deep).length;
   const totalSubAgents = useSubAgents
@@ -599,7 +621,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
       basePrompt = basePrompt
         .replace(/\{\{REPO_NAME\}\}/g, repoFullName)
         .replace(/\{\{FRAMEWORK_INFO\}\}/g, frameworkInfo)
-        .replace(/\{\{ARCHITECTURE_MAP\}\}/g, architectureMap.substring(0, 15000));
+        .replace(/\{\{ARCHITECTURE_MAP\}\}/g, '[See Architecture Map in shared context above]');
     }
 
     agentStatus[idx] = { ...agentStatus[idx], status: 'running' };
@@ -610,7 +632,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
       // Check safety limits before starting sub-agents
       if (aborted) {
         agentStatus[idx] = { ...agentStatus[idx], status: 'skipped' };
-        return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 } };
+        return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, cacheWriteTokens: 0, cacheReadTokens: 0 } };
       }
 
       logAndBroadcast(`    [${agent.id}] ${modules.length} sub-agents (deep scan per module)`);
@@ -670,7 +692,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. The file must contain your FULL detailed analysis with all findings, not just a summary.
 4. Your text response should be a brief summary only — the detailed report goes in the file.`;
 
-        return { promise: runClaudeAgentic(subPrompt, repoDir, AGENT_TIMEOUT, agentModel), outputFile: subOutputFile };
+        return { promise: runClaudeWithTools(subPrompt, repoDir, AGENT_TIMEOUT, agentModel, scanCachePrefix, [auditsBaseDir]), outputFile: subOutputFile };
       });
 
       const subResults = await Promise.all(subPromises.map(s => s.promise));
@@ -751,7 +773,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 
       if (successfulSubCount > 0 && modules.length > 2 && !aborted) {
         logAndBroadcast(`    [${agent.id}] Merging ${successfulSubCount}/${modules.length} sub-agent results...`);
-        const mergeResult = await runClaudeAgentic(
+        const mergeResult = await runClaudeWithTools(
           `Merge the following ${modules.length} sub-agent reports for the ${agent.name} analysis of ${repoFullName}.
 
 Remove duplicates. Keep all unique findings. Sort by severity.
@@ -781,7 +803,7 @@ ${mergedResult}`,
       }
       broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
 
-      return { agent, result: { success: deepSuccess, result: mergedResult, cost: agentCost, durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
+      return { agent, result: { success: deepSuccess, result: mergedResult, cost: agentCost, durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0 } };
     }
 
     // ── Holistic agents (single agent, full repo) ──
@@ -827,10 +849,10 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     // Check safety limits before starting
     if (aborted) {
       agentStatus[idx] = { ...agentStatus[idx], status: 'skipped' };
-      return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 } };
+      return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, cacheWriteTokens: 0, cacheReadTokens: 0 } };
     }
 
-    let result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, agentModel);
+    let result = await runClaudeWithTools(fullPrompt, repoDir, AGENT_TIMEOUT, agentModel, scanCachePrefix, [auditsBaseDir]);
     totalCost += result.cost;
 
     // Check time limit after each agent
@@ -875,7 +897,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
       agentStatus[idx] = { ...agentStatus[idx], status: 'retrying', attempt };
       broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
       await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
-      result = await runClaudeAgentic(fullPrompt, repoDir, AGENT_TIMEOUT, agentModel);
+      result = await runClaudeWithTools(fullPrompt, repoDir, AGENT_TIMEOUT, agentModel, scanCachePrefix, [auditsBaseDir]);
       totalCost += result.cost;
 
       // Check file after each retry attempt
@@ -1000,7 +1022,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     broadcastScanProgress(scanId, { phase: 'coverage-gap', agents: agentStatus, totalCost });
 
     const gapOutputFile = path.join(auditDir, '00-coverage-gaps.md');
-    const gapResult = await runClaudeAgentic(
+    const gapResult = await runClaudeWithTools(
       `You are a Coverage Gap Agent for the code audit of "${repoFullName}".
 
 The main audit agents MISSED the following ${gapFiles.length} files. Your job is to review them for issues.
@@ -1037,7 +1059,9 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. Your text response should be a brief summary only — the detailed report goes in the file.`,
       repoDir,
       AGENT_TIMEOUT,
-      agentModel
+      agentModel,
+      undefined, // no cache prefix
+      [auditsBaseDir]
     );
 
     totalCost += gapResult.cost;
@@ -1106,7 +1130,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 
   // Agentic aggregation with selected model (1M context support)
   const aggOutputFile = path.join(auditDir, '12-summary-report.md');
-  const aggResult = await runClaudeAgentic(
+  const aggResult = await runClaudeWithTools(
     `You are creating the final Code Audit Report for "${repoFullName}".
 
 Combine the following ${successfulResults.length} agent reports into ONE structured report (${failedResults.length > 0 ? `${failedResults.length} agents failed and are excluded` : 'all agents succeeded'}).
@@ -1224,7 +1248,9 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 5. Your text response should be a brief summary only — the detailed report goes in the file.`,
     repoDir,
     AGENT_TIMEOUT,
-    model
+    model,
+    undefined, // no cache prefix
+    [auditsBaseDir]
   );
 
   totalCost += aggResult.cost;

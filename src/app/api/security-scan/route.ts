@@ -2,7 +2,7 @@ export const dynamic = 'force-dynamic';
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb, addCost } from '@/lib/db';
-import { runClaudeAgentic, AVAILABLE_MODELS, type ModelKey, getKeyValue } from '@/lib/claude';
+import { runClaudeWithTools, AVAILABLE_MODELS, type ModelKey, getKeyValue } from '@/lib/claude';
 import { logAndBroadcast, broadcastScanProgress } from '@/lib/websocket';
 import { execSync } from 'child_process';
 import fs from 'fs';
@@ -338,8 +338,9 @@ async function runSecurityScan(
     .replace(/\{\{PLATFORM_NAME\}\}/g, platformName)
     .replace(/\{\{REPOS_DIR\}\}/g, workingDir);
 
-  const mappingOutputFile = path.join(getAuditsDir(), 'security-audits', `_mapping-${scanId}.md`);
-  const mappingResult = await runClaudeAgentic(
+  const auditsBaseDir = getAuditsDir(); // Shared allowed write dir for all agent calls
+  const mappingOutputFile = path.join(auditsBaseDir, 'security-audits', `_mapping-${scanId}.md`);
+  const mappingResult = await runClaudeWithTools(
     `${mappingPrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nNavigate to the listed paths to analyze each repo.
 
 OUTPUT INSTRUCTIONS (MANDATORY):
@@ -348,7 +349,9 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. Your text response should be a brief summary only — the detailed map goes in the file.`,
     workingDir,
     AGENT_TIMEOUT_MS,
-    model
+    model,
+    undefined, // no cache prefix
+    [auditsBaseDir]
   );
 
   totalCost += mappingResult.cost;
@@ -417,6 +420,22 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     fileManifestBlock = `\n📋 FILE MANIFEST (${totalFiles} files — you MUST review ALL of these):\nFirst ${MAX_INLINE_FILES} files listed here, full list in: ${path.join(auditDir, '00-file-manifest.md')}\n${allFilesList.slice(0, MAX_INLINE_FILES).map(f => `- ${f}`).join('\n')}\n... and ${totalFiles - MAX_INLINE_FILES} more (see manifest file)`;
   }
 
+  // ── Build shared cache prefix for prompt caching across all security agents ──
+  const scanCachePrefix = [
+    `## Architecture Map`,
+    architectureMap.substring(0, 15000),
+    ``,
+    `## Platform Context`,
+    `Platform: ${platformName}`,
+    `Working Directory: ${workingDir}`,
+    `Repos (Name: Path):`,
+    repoPathsList,
+    ``,
+    `## File Manifest (${totalFiles} source files across ${repos.length} repos)`,
+    manifestContent,
+  ].join('\n');
+  logAndBroadcast(`  [Security] Cache-Prefix: ${Math.round(scanCachePrefix.length / 1024)}KB (shared across all agents for prompt caching)`);
+
   // ── Phase 1: 8 Security Agents parallel ──
   logAndBroadcast(`  [Security] Phase 1: ${SCAN_AGENTS.length} Security Agents parallel (${modelInfo.name}, ${presetName})...`);
   agentStatus.forEach(a => a.status = 'running' as any);
@@ -432,7 +451,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     basePrompt = basePrompt
       .replace(/\{\{PLATFORM_NAME\}\}/g, platformName)
       .replace(/\{\{REPOS_DIR\}\}/g, workingDir)
-      .replace(/\{\{ARCHITECTURE_MAP\}\}/g, architectureMap.substring(0, 15000));
+      .replace(/\{\{ARCHITECTURE_MAP\}\}/g, '[See Architecture Map in shared context above]');
 
     const outputFile = path.join(auditDir, `${agent.id}.md`);
     const fullPrompt = `${basePrompt}\n\nRepos (Name: Path):\n${repoPathsList}\n\nYou have full access to ALL files. Navigate to the paths listed above to analyze each repo.
@@ -462,10 +481,10 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     // Check safety limits before starting
     if (aborted) {
       agentStatus[idx] = { ...agentStatus[idx], status: 'skipped' };
-      return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 } };
+      return { agent, result: { success: false, result: 'Skipped: scan aborted', durationMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, cacheWriteTokens: 0, cacheReadTokens: 0 } };
     }
 
-    let result = await runClaudeAgentic(fullPrompt, workingDir, AGENT_TIMEOUT_MS, model);
+    let result = await runClaudeWithTools(fullPrompt, workingDir, AGENT_TIMEOUT_MS, model, scanCachePrefix, [auditsBaseDir]);
     totalCost += result.cost;
 
     // Check time limit after each agent
@@ -484,7 +503,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
       broadcastScanProgress(scanId, { phase: 'agents', agents: agentStatus, totalCost });
       // Delay before retry to avoid rate limits
       await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
-      result = await runClaudeAgentic(fullPrompt, workingDir, AGENT_TIMEOUT_MS, model);
+      result = await runClaudeWithTools(fullPrompt, workingDir, AGENT_TIMEOUT_MS, model, scanCachePrefix, [auditsBaseDir]);
       totalCost += result.cost;
 
       // Re-check limits after each retry
@@ -617,7 +636,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     broadcastScanProgress(scanId, { phase: 'coverage-gap', agents: agentStatus, totalCost });
 
     const gapOutputFile = path.join(auditDir, '00-coverage-gaps.md');
-    const gapResult = await runClaudeAgentic(
+    const gapResult = await runClaudeWithTools(
       `You are a Coverage Gap Agent for the security audit of "${platformName}".
 
 The main security agents MISSED the following ${gapFiles.length} files. Your job is to review them for security issues.
@@ -653,7 +672,9 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 3. Your text response should be a brief summary only — the detailed report goes in the file.`,
       workingDir,
       AGENT_TIMEOUT_MS,
-      model
+      model,
+      undefined, // no cache prefix
+      [auditsBaseDir]
     );
 
     totalCost += gapResult.cost;
@@ -714,7 +735,7 @@ OUTPUT INSTRUCTIONS (MANDATORY):
     .run(fullReport, scanId);
 
   const aggOutputFile = path.join(auditDir, '10-summary-report.md');
-  const aggResult = await runClaudeAgentic(
+  const aggResult = await runClaudeWithTools(
     `You are creating the final Security Audit Report for the "${platformName}" platform.
 
 Combine the following ${successfulResults.length} security agent reports into ONE structured report (${failedResults.length > 0 ? `${failedResults.length} agents failed and are excluded` : 'all agents succeeded'}).
@@ -831,7 +852,9 @@ OUTPUT INSTRUCTIONS (MANDATORY):
 4. Your text response should be a brief summary only — the detailed report goes in the file.`,
     workingDir,
     600000,
-    model
+    model,
+    undefined, // no cache prefix
+    [auditsBaseDir]
   );
 
   totalCost += aggResult.cost;

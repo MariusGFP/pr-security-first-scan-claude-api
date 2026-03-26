@@ -1,7 +1,7 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { runClaude, calculateCost } from './claude';
+import { runClaude, calculateCost, PRICING } from './claude';
 import { logAndBroadcast, broadcast } from './websocket';
 import {
   createReview, updateReview, createReviewAgent, updateReviewAgent,
@@ -241,6 +241,7 @@ async function runAgentWithSubAgents(
   reviewId: number,
   thresholds: Thresholds,
   mdContext: string = '',
+  cachePrefix?: string,
 ): Promise<AgentResult> {
   const startTime = Date.now();
   const dbAgentId = createReviewAgent({
@@ -276,42 +277,29 @@ async function runAgentWithSubAgents(
   broadcast({ type: 'agent_update', data: { reviewId, agentId: agent.id, status: 'running', subAgents: subAgentCount } });
 
   let totalTokens = 0;
-
-  // Read relevant context files to include in prompt (replaces agentic file reading)
-  const contextFiles = getRelevantContext(repoDir, diffFiles);
+  let totalCacheWriteTokens = 0;
+  let totalCacheReadTokens = 0;
 
   if (subAgentCount === 1) {
-    const claudeResult = await runClaude(
-      `${basePrompt}
+    // Single agent: shared context + diff is in cachePrefix (identical for all 10 agents).
+    // Only the agent-specific prompt is unique per agent → not cached.
+    const agentPrompt = `${basePrompt}
 
 Du bist der ${agent.name}-Agent. Dein Fokus: ${agent.focus}
 
-Repository: ${repoName}
-PR #${prNumber}: ${prTitle}
-${prBody ? `\nBeschreibung vom Ersteller:\n${prBody}\n` : ''}
-
-${mdContext ? `## Dokumentation/Specs aus der PR (als Kontext — NICHT reviewen):\n${mdContext}\n\nDie obigen .md-Dateien sind Teil der PR und geben dir Kontext über Intent und Architektur der Änderungen. Nutze sie um zu verstehen WAS der Entwickler erreichen wollte. Reviewe aber NUR den Code-Diff unten.\n` : ''}
-
-## Diff der Code-Änderungen:
-\`\`\`diff
-${diff.substring(0, 80000)}
-\`\`\`
-
-${contextFiles ? `## Relevanter Kontext (bestehende Dateien):\n${contextFiles}\n` : ''}
-
 Analysiere den Code-Diff oben. Gib NUR Findings aus die zu deinem Fachgebiet (${agent.name}) gehören.
+Falls keine Issues: "✅ Keine ${agent.name} Issues gefunden."`;
 
-Format pro Finding:
-- **Severity**: 🔴 Kritisch / 🟡 Warnung / 🔵 Hinweis
-- **Datei:Zeile**: Beschreibung
-- **Fix-Vorschlag**: Konkreter Code
-
-Falls keine Issues: "✅ Keine ${agent.name} Issues gefunden."`,
-      repoDir
-    );
+    const claudeResult = await runClaude(agentPrompt, repoDir, 300000, cachePrefix);
 
     totalTokens = claudeResult.totalTokens;
+    totalCacheWriteTokens = claudeResult.cacheWriteTokens;
+    totalCacheReadTokens = claudeResult.cacheReadTokens;
     const duration = Math.round((Date.now() - startTime) / 1000);
+
+    if (claudeResult.cacheReadTokens > 0) {
+      logAndBroadcast(`    [${agent.id}] Cache HIT: ${claudeResult.cacheReadTokens} tokens from cache`);
+    }
 
     updateReviewAgent(dbAgentId, {
       status: claudeResult.success ? 'completed' : 'failed',
@@ -323,21 +311,28 @@ Falls keine Issues: "✅ Keine ${agent.name} Issues gefunden."`,
     return { agent, result: claudeResult.result, success: claudeResult.success, duration, subAgents: 1, tokens: totalTokens, cost: claudeResult.cost, dbAgentId };
   }
 
-  // Multiple sub-agents in parallel
+  // Multiple sub-agents in parallel.
+  // For sub-agents, each chunk has different diff content, so we build a
+  // per-agent cache prefix: shared repo context + agent base prompt.
+  // The chunk-specific diff goes in the non-cached part.
   const subPromises = chunks.map(chunk => {
     const chunkContext = getRelevantContext(repoDir, chunk.files.map(f => ({ filename: f, content: '' })));
-    return runClaude(
-      `${basePrompt}
+
+    // Sub-agent cache prefix: shared repo context (without diff, since diff varies per chunk)
+    let subCachePrefix: string | undefined;
+    if (cachePrefix) {
+      const diffHeadingIdx = cachePrefix.indexOf('## Diff der Code-Änderungen:');
+      subCachePrefix = diffHeadingIdx !== -1
+        ? cachePrefix.substring(0, diffHeadingIdx).trim()
+        : cachePrefix; // Fallback: use full prefix if heading not found
+    }
+
+    const subPrompt = `${basePrompt}
 
 Du bist Sub-Agent ${chunk.id}/${subAgentCount} des ${agent.name}-Agents.
 Dein Fokus: ${agent.focus}
 Dein Teilbereich: ${chunk.focus}
 Dateien: ${chunk.files.join(', ')}
-
-Repository: ${repoName}
-PR #${prNumber}: ${prTitle}
-
-${mdContext ? `## Dokumentation/Specs aus der PR (als Kontext — NICHT reviewen):\n${mdContext}\n\nNutze die obigen .md-Dateien als Kontext. Reviewe NUR den Code-Diff unten.\n` : ''}
 
 ## Diff der Code-Änderungen:
 \`\`\`diff
@@ -347,20 +342,20 @@ ${chunk.diffContent.substring(0, 80000)}
 ${chunkContext ? `## Relevanter Kontext (bestehende Dateien):\n${chunkContext}\n` : ''}
 
 Analysiere den Code-Diff oben. Gib NUR Findings aus die zu ${agent.name} gehören.
+Falls keine Issues: "✅ Keine ${agent.name} Issues in ${chunk.focus} gefunden."`;
 
-Format pro Finding:
-- **Severity**: 🔴 Kritisch / 🟡 Warnung / 🔵 Hinweis
-- **Datei:Zeile**: Beschreibung
-- **Fix-Vorschlag**: Konkreter Code
-
-Falls keine Issues: "✅ Keine ${agent.name} Issues in ${chunk.focus} gefunden."`,
-      repoDir
-    );
+    return runClaude(subPrompt, repoDir, 300000, subCachePrefix);
   });
 
   const subResults = await Promise.all(subPromises);
   totalTokens = subResults.reduce((sum, r) => sum + r.totalTokens, 0);
+  totalCacheWriteTokens = subResults.reduce((sum, r) => sum + r.cacheWriteTokens, 0);
+  totalCacheReadTokens = subResults.reduce((sum, r) => sum + r.cacheReadTokens, 0);
   let totalCost = subResults.reduce((sum, r) => sum + r.cost, 0);
+
+  if (totalCacheReadTokens > 0) {
+    logAndBroadcast(`    [${agent.id}] Cache HIT: ${totalCacheReadTokens} tokens from cache across ${subAgentCount} sub-agents`);
+  }
 
   const mergedResults = subResults
     .map((r, i) => `#### Teil ${i + 1}: ${chunks[i].focus}\n${r.result}`)
@@ -504,10 +499,134 @@ export async function runPRReview(
     updateReview(reviewId, { diff_lines: diffLineCount, diff_files: codeDiffFiles.length });
     logAndBroadcast(`  [${reviewKey}] Diff: ${diffLineCount} Zeilen Code, ${codeDiffFiles.length} Code-Dateien, ${mdFiles.length} Doku-Dateien`);
 
-    // Run all 9 agents in parallel (only on code, .md as context)
+    // ── Smart PR Skipping: skip irrelevant agents based on changed file types ──
+    const codeExts = codeDiffFiles.map(f => path.extname(f.filename).toLowerCase());
+    const uniqueExts = new Set(codeExts);
+
+    const isDepsOnly = codeDiffFiles.length > 0 && codeDiffFiles.every(f => {
+      const bn = path.basename(f.filename).toLowerCase();
+      return bn === 'package.json' || bn === 'package-lock.json' || bn === 'yarn.lock'
+        || bn === 'pnpm-lock.yaml' || bn === 'composer.json' || bn === 'composer.lock'
+        || bn === 'requirements.txt' || bn === 'poetry.lock' || bn === 'gemfile.lock'
+        || bn === 'go.sum' || bn === 'go.mod';
+    });
+
+    const isStyleOnly = codeDiffFiles.length > 0 && [...uniqueExts].every(ext =>
+      ['.css', '.scss', '.sass', '.less', '.styl', '.pcss'].includes(ext)
+    );
+
+    const isTestOnly = codeDiffFiles.length > 0 && codeDiffFiles.every(f => {
+      const bn = f.filename.toLowerCase();
+      return bn.includes('.test.') || bn.includes('.spec.') || bn.includes('__tests__')
+        || bn.includes('__mocks__') || bn.startsWith('test/') || bn.startsWith('tests/');
+    });
+
+    // Config-only: only match known low-risk config files.
+    // Excludes CI/CD workflows, Kubernetes manifests, and other security-sensitive YAML.
+    const LOW_RISK_CONFIG = new Set([
+      'tsconfig.json', 'tailwind.config.js', 'tailwind.config.ts',
+      'postcss.config.js', 'postcss.config.mjs', 'vite.config.ts', 'vite.config.js',
+      'next.config.js', 'next.config.mjs', 'next.config.ts',
+      'eslint.config.js', 'eslint.config.mjs', '.eslintrc.json', '.eslintrc.js',
+      '.prettierrc', '.prettierrc.json', '.prettierrc.js',
+      '.gitignore', '.gitattributes', '.editorconfig', '.browserslistrc',
+      '.nvmrc', '.node-version', '.npmrc', '.yarnrc.yml',
+    ]);
+    const CONFIG_EXTENSIONS = new Set(['.config.js', '.config.ts', '.config.mjs']);
+
+    const isConfigOnly = codeDiffFiles.length > 0 && codeDiffFiles.every(f => {
+      const bn = path.basename(f.filename).toLowerCase();
+      const fp = f.filename.toLowerCase();
+      // Reject CI/CD, workflows, k8s, and .env files — these need full review
+      if (fp.includes('.github/') || fp.includes('.gitlab-ci') || fp.includes('k8s/')
+        || fp.includes('kubernetes/') || bn.startsWith('.env')) {
+        return false;
+      }
+      return LOW_RISK_CONFIG.has(bn)
+        || CONFIG_EXTENSIONS.has(path.extname(bn))
+        || bn === 'dockerfile' || bn === 'docker-compose.yml';
+    });
+
+    // No code files at all (doc-only PR) — already handled: codeDiffFiles is empty
+    if (codeDiffFiles.length === 0 && mdFiles.length > 0) {
+      logAndBroadcast(`  [${reviewKey}] 📝 Nur Doku-Änderungen — Auto-Approve (kein API-Call)`);
+      const docResult = '✅ Nur Dokumentations-Änderungen — keine Code-Review nötig.';
+      updateReview(reviewId, {
+        status: 'completed',
+        total_sub_agents: 0,
+        duration_seconds: 0,
+        findings_critical: 0, findings_warning: 0, findings_info: 0,
+        aggregated_result: docResult,
+        estimated_cost: 0,
+        completed_at: new Date().toISOString(),
+      });
+      const commentBody = `## 🤖 Claude Code Review — PR #${prNumber}\n\n${docResult}\n\n---\n*0 Agents · Doc-only PR · $0.00 · Mac Mini M4*`;
+      const tempCommentFile = path.join(LOGS_DIR, `temp-comment-${prNumber}.txt`);
+      fs.writeFileSync(tempCommentFile, commentBody);
+      execSync(`gh pr comment ${prNumber} --body-file "${tempCommentFile}"`, {
+        cwd: repoDir, stdio: 'pipe', timeout: 30000,
+        env: { ...process.env, PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin' },
+      });
+      try { fs.unlinkSync(tempCommentFile); } catch { /* ignore */ }
+      activeReviews.delete(reviewKey);
+      broadcast({ type: 'review_completed', data: { reviewId, duration: 0, findings: { critical: 0, warning: 0, info: 0 } } });
+      return;
+    }
+
+    // Select relevant agents based on PR content
+    let selectedAgents = AGENTS;
+    let skipReason = '';
+
+    if (isDepsOnly) {
+      selectedAgents = AGENTS.filter(a => a.id === '03-security' || a.id === '09-dependency-check');
+      skipReason = 'Deps-only PR';
+    } else if (isStyleOnly) {
+      selectedAgents = AGENTS.filter(a => a.id === '01-code-quality' || a.id === '06-behavioral-impact');
+      skipReason = 'Style-only PR';
+    } else if (isTestOnly) {
+      selectedAgents = AGENTS.filter(a => a.id === '01-code-quality' || a.id === '02-bug-analysis' || a.id === '08-test-coverage');
+      skipReason = 'Test-only PR';
+    } else if (isConfigOnly) {
+      selectedAgents = AGENTS.filter(a => a.id === '03-security' || a.id === '04-best-practices');
+      skipReason = 'Config-only PR';
+    }
+
+    // Fallback: if filtering removed all agents (e.g., IDs changed), run all
+    if (selectedAgents.length === 0) {
+      selectedAgents = AGENTS;
+      skipReason = '';
+      logAndBroadcast(`  [${reviewKey}] ⚠ Agent-Filter ergab 0 Agents, Fallback auf alle`);
+    }
+
+    if (selectedAgents.length < AGENTS.length) {
+      logAndBroadcast(`  [${reviewKey}] ⚡ Smart Skip: ${skipReason} → ${selectedAgents.length}/${AGENTS.length} Agents (${selectedAgents.map(a => a.name).join(', ')})`);
+    }
+
+    // Build shared cache prefix — identical for all agents, cached after first call.
+    // Subsequent agents get 90% cheaper input tokens for this block.
+    const sharedContextFiles = getRelevantContext(repoDir, codeDiffFiles);
+    const sharedCachePrefix = [
+      `## Relevanter Kontext (bestehende Dateien):`,
+      sharedContextFiles,
+      '',
+      `## PR-Information:`,
+      `Repository: ${repoName}`,
+      `PR #${prNumber}: ${prTitle}`,
+      prBody ? `\nBeschreibung vom Ersteller:\n${prBody}` : '',
+      mdContext ? `\n## Dokumentation/Specs aus der PR (als Kontext — NICHT reviewen):\n${mdContext}\n\nDie obigen .md-Dateien sind Teil der PR und geben dir Kontext über Intent und Architektur der Änderungen. Nutze sie um zu verstehen WAS der Entwickler erreichen wollte. Reviewe aber NUR den Code-Diff unten.` : '',
+      '',
+      `## Diff der Code-Änderungen:`,
+      '```diff',
+      codeDiff.substring(0, 80000),
+      '```',
+    ].filter(Boolean).join('\n');
+
+    logAndBroadcast(`  [${reviewKey}] Cache-Prefix: ${Math.round(sharedCachePrefix.length / 1024)}KB (wird über alle Agents geteilt)`);
+
+    // Run selected agents in parallel (only on code, .md as context)
     const startTime = Date.now();
-    const agentPromises = AGENTS.map(agent =>
-      runAgentWithSubAgents(agent, codeDiff, codeDiffFiles, diffLineCount, repoDir, repoName, prNumber, prTitle, prBody, reviewId, thresholds, mdContext)
+    const agentPromises = selectedAgents.map(agent =>
+      runAgentWithSubAgents(agent, codeDiff, codeDiffFiles, diffLineCount, repoDir, repoName, prNumber, prTitle, prBody, reviewId, thresholds, mdContext, sharedCachePrefix)
     );
 
     const results = await Promise.all(agentPromises);
@@ -516,22 +635,40 @@ export async function runPRReview(
     const totalTokens = results.reduce((sum, r) => sum + r.tokens, 0);
     let totalCost = results.reduce((sum, r) => sum + r.cost, 0);
 
-    logAndBroadcast(`  [${reviewKey}] Alle Agents fertig (${totalDuration}s, ${totalSubAgents} Sub-Agents). Aggregation...`);
+    // Calculate cache savings for logging
+    const cachePrefixTokens = Math.ceil(sharedCachePrefix.length / 4); // rough estimate
+    const cacheHitAgents = results.length - 1; // first agent writes cache, rest read
+    const savedTokens = cacheHitAgents * cachePrefixTokens;
+    const savedCost = (savedTokens / 1_000_000) * (PRICING.input - PRICING.cacheRead);
+    logAndBroadcast(`  [${reviewKey}] Alle Agents fertig (${totalDuration}s, ${totalSubAgents} Sub-Agents). Cache-Ersparnis: ~$${savedCost.toFixed(3)} (~${savedTokens.toLocaleString()} Tokens).`);
 
-    // Final aggregation
-    const agentResults = results.map(r =>
-      `### ${r.agent.name} (${r.subAgents} Sub-Agent${r.subAgents > 1 ? 's' : ''}, ${r.duration}s)\n${r.result}`
-    ).join('\n\n---\n\n');
+    // ── Clean PR Auto-Approve: skip aggregation if all agents found no issues ──
+    const allClean = results.every(r =>
+      r.success && r.result.includes('✅') && !r.result.match(/🔴|🟡/)
+    );
 
-    const aggregationPromptFile = path.join(PROMPTS_DIR, 'aggregation.md');
-    const aggregationBase = fs.existsSync(aggregationPromptFile)
-      ? fs.readFileSync(aggregationPromptFile, 'utf8')
-      : '';
+    let aggregatedResult: string;
+    let finalTokens = totalTokens;
 
-    const aggResult = await runClaude(
-      `${aggregationBase}
+    if (allClean) {
+      logAndBroadcast(`  [${reviewKey}] ✅ Alle ${selectedAgents.length} Agents clean — Auto-Approve (kein Aggregation-Call)`);
+      aggregatedResult = `✅ **Sieht gut aus!** ${selectedAgents.length}/${selectedAgents.length} Agents haben keine Issues gefunden.${skipReason ? `\n\n*${skipReason} — nur relevante Agents wurden ausgeführt.*` : ''}`;
+    } else {
+      logAndBroadcast(`  [${reviewKey}] Aggregation...`);
 
-Fasse die folgenden 10 Agent-Reports zu EINEM gebündelten PR-Review zusammen.
+      const agentResults = results.map(r =>
+        `### ${r.agent.name} (${r.subAgents} Sub-Agent${r.subAgents > 1 ? 's' : ''}, ${r.duration}s)\n${r.result}`
+      ).join('\n\n---\n\n');
+
+      const aggregationPromptFile = path.join(PROMPTS_DIR, 'aggregation.md');
+      const aggregationBase = fs.existsSync(aggregationPromptFile)
+        ? fs.readFileSync(aggregationPromptFile, 'utf8')
+        : '';
+
+      const aggResult = await runClaude(
+        `${aggregationBase}
+
+Fasse die folgenden ${selectedAgents.length} Agent-Reports zu EINEM gebündelten PR-Review zusammen.
 
 Repository: ${repoName}
 PR #${prNumber}: ${prTitle}
@@ -544,16 +681,18 @@ REGELN:
 3. Nach Severity sortieren: Kritisch → Warnung → Hinweis
 4. Pro Finding: Datei:Zeile, Beschreibung, Fix-Vorschlag
 5. Maximum 30 Findings
-6. Wenn alle Agents "keine Issues" → "✅ Sieht gut aus!"
-7. KEIN Meta-Kommentar zu den Agents
+6. KEIN Meta-Kommentar zu den Agents
 
 Ergebnisse:
 
 ${agentResults}`,
-      repoDir
-    );
+        repoDir
+      );
 
-    const aggregatedResult = aggResult.success ? aggResult.result : `## Agent-Ergebnisse (ungefiltert)\n\n${agentResults}`;
+      aggregatedResult = aggResult.success ? aggResult.result : `## Agent-Ergebnisse (ungefiltert)\n\n${agentResults}`;
+      totalCost += aggResult.cost;
+      finalTokens += aggResult.totalTokens;
+    }
 
     // Count findings from aggregated result
     const criticalCount = (aggregatedResult.match(/🔴/g) || []).length;
@@ -564,15 +703,13 @@ ${agentResults}`,
     logAndBroadcast(`  [${reviewKey}] Poste Review-Kommentar...`);
 
     const successCount = results.filter(r => r.success).length;
-    totalCost += aggResult.cost;
-    const finalTokens = totalTokens + aggResult.totalTokens;
 
     const commentBody = `## 🤖 Claude Code Review — PR #${prNumber}
 
 ${aggregatedResult}
 
 ---
-*${totalSubAgents} Agents (9 Kategorien) · ${successCount}/9 erfolgreich · ${totalDuration}s · $${totalCost.toFixed(2)} · Mac Mini M4*`;
+*${totalSubAgents} Agents (${selectedAgents.length} Kategorien) · ${successCount}/${selectedAgents.length} erfolgreich · ${totalDuration}s · $${totalCost.toFixed(2)} · Mac Mini M4*`;
 
     const tempCommentFile = path.join(LOGS_DIR, `temp-comment-${prNumber}.txt`);
     fs.writeFileSync(tempCommentFile, commentBody);
