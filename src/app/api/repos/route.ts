@@ -13,7 +13,7 @@ function getReposDir(): string {
   if (configured) return configured.replace(/^~/, process.env.HOME || '~');
   return path.join(process.env.HOME || '~', 'repos');
 }
-const WEBHOOK_URL = 'https://webhook.serendipity.education/webhook';
+const WEBHOOK_URL = 'https://webhook.serendipity.education/api/webhook';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'mac-mini-claude-webhook-2024';
 
 export async function GET() {
