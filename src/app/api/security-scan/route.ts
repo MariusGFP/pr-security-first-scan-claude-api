@@ -328,6 +328,31 @@ async function runSecurityScan(
   const agentStatus: Array<{ id: string; name: string; status: string; chars?: number; cost?: number; attempt?: number }> =
     SCAN_AGENTS.map(a => ({ id: a.id, name: a.name, status: 'pending' }));
 
+  // ── Phase Pre: Update repos to latest origin state ──
+  // Mirrors PR-Review behavior (review-engine.ts) so the scan always runs against fresh code.
+  // Failures are logged but do not abort the scan — fall back to local state.
+  logAndBroadcast(`  [Security] Updating repos to latest origin state...`);
+  const pathsToUpdate = repoFullPaths ?? repos.map(r => path.join(reposDir, r));
+  for (let i = 0; i < pathsToUpdate.length; i++) {
+    const repoPath = pathsToUpdate[i];
+    const repoName = repos[i];
+    if (!fs.existsSync(path.join(repoPath, '.git'))) {
+      logAndBroadcast(`    ⏭ ${repoName}: not a git repo, skipped`);
+      continue;
+    }
+    try {
+      const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+        cwd: repoPath, stdio: 'pipe', timeout: 10000,
+      }).toString().trim();
+      execSync('git fetch origin', { cwd: repoPath, stdio: 'pipe', timeout: 60000 });
+      execSync(`git reset --hard origin/${branch}`, { cwd: repoPath, stdio: 'pipe', timeout: 30000 });
+      logAndBroadcast(`    ✅ ${repoName}: updated (${branch})`);
+    } catch (e: any) {
+      const errMsg = (e.stderr?.toString() || e.message || 'unknown error').split('\n')[0];
+      logAndBroadcast(`    ⚠️ ${repoName}: update failed — ${errMsg}`);
+    }
+  }
+
   // ── Phase 0: Architecture Mapping ──
   logAndBroadcast(`  [Security] Phase 0: Architecture Mapping (${modelInfo.name})...`);
   broadcastScanProgress(scanId, { phase: 'mapping', agents: agentStatus });
